@@ -1,0 +1,16 @@
+{
+  "identifier": "toolkit",
+  "name": "Toolkit",
+  "version": "1.0.0",
+  "author": "User",
+  "description": "An extension that allows the main LLM to call various tools (native web search, inline memory recall).",
+  "entry_backend": "spindle.js",
+  "permissions": [
+    "tools",
+    "memories",
+    "chats",
+    "images",
+    "generation",
+    "web_search"
+  ]
+}
