@@ -1,0 +1,18 @@
+{
+ "identifier": "inline_memory",
+ "name": "Toolkit",
+ "version": "1.1.0",
+ "author": "User",
+ "description": "All-in-one inline toolkit for on-demand Vault and Interlink memory recall, live web search, and background image captioning.",
+ "entry_backend": "backend.js",
+ "entry_frontend": "frontend.js",
+ "permissions": [
+  "tools",
+  "memories",
+  "chats",
+  "chat_mutation",
+  "images",
+  "generation",
+  "web_search"
+ ]
+}
