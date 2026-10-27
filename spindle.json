@@ -1,0 +1,17 @@
+{
+ "identifier": "toolkit",
+ "name": "Toolkit",
+ "version": "1.0.0",
+ "author": "User",
+ "description": "All-in-one inline toolkit for on-demand Vault and Interlink memory recall, live web search, and background image captioning.",
+ "entry_backend": "spindle.js",
+ "permissions": [
+  "tools",
+  "memories",
+  "chats",
+  "chat_mutation",
+  "images",
+  "generation",
+  "web_search"
+ ]
+}
