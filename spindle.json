@@ -1,0 +1,16 @@
+{
+  "identifier": "toolkit",
+  "name": "Toolkit",
+  "version": "1.0.0",
+  "author": "User",
+  "description": "Lets the main LLM actively search linked Vaults, Interlinks, and Entity facts on demand.",
+  "entry_backend": "spindle.js",
+  "permissions": [
+    "tools",
+    "memories",
+    "chats",
+    "images",
+    "generation",
+    "web_search"
+  ]
+}
