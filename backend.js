@@ -296,6 +296,7 @@
     if (payload.toolName === "web_search") {
       const query2 = String(payload.args?.query || "").trim();
       console.log("=== WEB SEARCH TRIGGERED ===", query2, "userId:", userId);
+      await new Promise(r => setTimeout(r, 1200));
       if (spindle.generate?.quiet) {
         try {
           let connId = cachedConnectionId;
