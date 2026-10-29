@@ -110,7 +110,7 @@ async function setVaultMode(chatId, userId, targetMode) {
  return { mode: nextMode, label };
 }
 
-// === MEMORY FOLDERS SYSTEM (Global Storage + Cortex Entity Mirror) ===
+// === MEMORY FOLDERS SYSTEM (Global Storage + Native Databank Sync) ===
 async function getGlobalFolders(userId) {
  const uId = resolveUserId(userId);
  if (spindle.variables?.global?.get) {
@@ -130,9 +130,82 @@ async function getGlobalFolders(userId) {
  return Object.fromEntries(memoryFoldersCache.entries());
 }
 
+function buildFolderMarkdown(folder) {
+ const lines = [
+  `# ${folder.name}`,
+  `**Category:** ${folder.type || "topic"}`,
+  `**Description:** ${folder.description || `Memory Folder for ${folder.name}`}`,
+  `**Last Updated:** ${formatTime(folder.updatedAt)}`,
+  "",
+  "## Compiled Facts"
+ ];
+ (folder.facts || []).forEach((f, idx) => {
+  lines.push(`${idx + 1}. ${f}`);
+ });
+ return lines.join("\n");
+}
+
+async function syncFolderToDatabank(folder, userId) {
+ if (!spindle.databanks) return null;
+ try {
+  const rawBanks = await spindle.databanks.list(userId);
+  const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
+  let targetBank = banks.find(b => String(b.name || "").toLowerCase() === "memory folders" || String(b.name || "").toLowerCase() === "toolkit folders");
+
+  if (!targetBank && spindle.databanks.create) {
+   targetBank = await spindle.databanks.create({
+    name: "Memory Folders",
+    description: "Compiled topic dossiers managed by Assistant's Toolkit.",
+    scope: "global",
+    userId
+   }, userId);
+  }
+
+  const bankId = targetBank?.id || targetBank?.databankId;
+  if (!bankId) return null;
+
+  const markdown = buildFolderMarkdown(folder);
+  const docApi = spindle.databanks.documents || spindle.databanks.files || spindle.databanks.entries;
+
+  if (docApi) {
+   let existingDoc = null;
+   if (docApi.list) {
+    const rawDocs = await docApi.list(bankId, userId);
+    const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.documents || rawDocs?.files || rawDocs?.data || []);
+    existingDoc = docs.find(d => {
+     const dName = String(d.title || d.name || d.filename || "").toLowerCase().replace(/\.md$/, "");
+     return dName === folder.name.toLowerCase();
+    });
+   }
+
+   if (existingDoc?.id && docApi.update) {
+    await docApi.update(bankId, existingDoc.id, {
+     title: folder.name,
+     name: `${folder.name}.md`,
+     filename: `${folder.name}.md`,
+     content: markdown,
+     userId
+    }, userId);
+   } else if (docApi.create) {
+    await docApi.create(bankId, {
+     title: folder.name,
+     name: `${folder.name}.md`,
+     filename: `${folder.name}.md`,
+     content: markdown,
+     userId
+    }, userId);
+   }
+   console.log(`=== DATABANK SYNCED: ${folder.name} in Memory Folders ===`);
+   return bankId;
+  }
+ } catch (err) {
+  console.warn("Databank sync notice:", err.message);
+ }
+ return null;
+}
+
 async function saveMemoryFolder({ chatId, userId, folderName, folderType, description, facts }) {
  const uId = resolveUserId(userId);
- const cId = await getActiveChatId(chatId, uId);
  const cleanName = String(folderName || "").trim();
  if (!cleanName) return null;
 
@@ -155,13 +228,11 @@ async function saveMemoryFolder({ chatId, userId, folderName, folderType, descri
   : String(facts || "").split(/\n|\|/).map(s => s.trim()).filter(Boolean);
 
  const seen = new Set((existing.facts || []).map(f => String(f).toLowerCase().trim()));
- const newlyAdded = [];
  for (const f of incomingFacts) {
   const trimmed = String(f).trim();
   if (trimmed && !seen.has(trimmed.toLowerCase())) {
    existing.facts.push(trimmed);
    seen.add(trimmed.toLowerCase());
-   newlyAdded.push(trimmed);
   }
  }
  existing.updatedAt = Date.now();
@@ -178,28 +249,8 @@ async function saveMemoryFolder({ chatId, userId, folderName, folderType, descri
   }
  }
 
- // 2. Mirror into Cortex Entity card so it's visible in the Lumiverse UI
- if (cId && spindle.memories?.entities) {
-  try {
-   let entity = null;
-   if (spindle.memories.entities.findByName) {
-    entity = await spindle.memories.entities.findByName(cId, cleanName, uId);
-   }
-   if (!entity && spindle.memories.entities.upsert) {
-    entity = await spindle.memories.entities.upsert(cId, {
-     name: cleanName,
-     type: existing.type || "topic",
-     entityType: existing.type || "topic",
-     description: existing.description || `Memory Folder for ${cleanName}`,
-     facts: existing.facts
-    }, uId);
-   } else if (entity?.id && newlyAdded.length > 0 && spindle.memories.entities.addFacts) {
-    await spindle.memories.entities.addFacts(cId, entity.id, newlyAdded, uId);
-   }
-  } catch (e) {
-   console.warn("Entity mirror warning:", e.message);
-  }
- }
+ // 2. Sync to Lumiverse Native Databanks for UI viewing/management
+ await syncFolderToDatabank(existing, uId);
 
  console.log(`=== MEMORY FOLDER SAVED: ${cleanName} (${existing.facts.length} total facts) ===`);
  return existing;
@@ -317,6 +368,7 @@ function inspectSpindle() {
 
  return JSON.stringify({
   spindleRoot: Object.keys(spindle),
+  databanks: describeObj(spindle.databanks),
   memories: describeObj(spindle.memories),
   chats: describeObj(spindle.chats),
   chat: describeObj(spindle.chat),
@@ -328,7 +380,6 @@ function inspectSpindle() {
  }, null, 2);
 }
 
-// Filter out empty heuristic noise unless the entity actually has facts or a clean description
 function isUsefulEntity(e) {
  if (!e) return false;
  if (Array.isArray(e.facts) && e.facts.length > 0) return true;
@@ -396,7 +447,7 @@ function formatAndSortChunks(chunks) {
 spindle.registerTool({
  name: "recall_memory",
  display_name: "Inline Memory Recall & Folders",
- description: "Search persistent long-term memory, Memory Folders, linked Vaults, and past chat records (including searching messages by date/time). Can also create or update a Memory Folder using the optional folder_* parameters, or switch Vault Recall Mode using vault_mode.",
+ description: "Search persistent long-term memory, Memory Folders, Databanks, linked Vaults, and past chat records (including searching messages by date/time). Can also create or update a Memory Folder using the optional folder_* parameters, or switch Vault Recall Mode using vault_mode.",
  parameters: {
   type: "object",
   properties: {
@@ -457,9 +508,11 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
   const query = String(payload.args?.query || "").trim();
   console.log("=== WEB SEARCH TRIGGERED ===", query, "userId:", userId);
 
-  await new Promise(r => setTimeout(r, 1200));
+  // 2-second buffer BEFORE Request #2 so Request #1 fully closes on the proxy
+  await new Promise(r => setTimeout(r, 2000));
 
   if (spindle.generate?.quiet) {
+   let nativeResult = null;
    try {
     let connId = cachedConnectionId;
     if (!connId && spindle.connections?.list) {
@@ -486,11 +539,16 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
     const res = await spindle.generate.quiet(quietReq, userId);
     if (res?.content) {
-     return `=== WEB SEARCH RESULTS (Native) ===\n${res.content}`;
+     nativeResult = `=== WEB SEARCH RESULTS (Native) ===\n${res.content}`;
     }
    } catch (err) {
     console.warn("Quiet native search failed, falling back to SearXNG:", err.message);
+   } finally {
+    // 2-second buffer AFTER Request #2 so the proxy unlocks before Lumiverse fires Request #3
+    await new Promise(r => setTimeout(r, 2000));
    }
+
+   if (nativeResult) return nativeResult;
   }
 
   if (spindle.webSearch?.query) {
