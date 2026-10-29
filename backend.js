@@ -197,7 +197,6 @@ async function syncFolderToDatabank(folder, userId) {
     name: "Memory Folders",
     description: "Compiled topic dossiers managed by Assistant's Toolkit.",
     scope: "global",
-    is_enabled: true,
     enabled: true,
     userId: uId
    }, uId);
@@ -207,69 +206,44 @@ async function syncFolderToDatabank(folder, userId) {
   if (!bankId) return null;
 
   const markdown = buildFolderMarkdown(folder);
-  const docApi = spindle.databanks.documents || spindle.databanks.files || spindle.databanks.entries;
+  const bytes = new TextEncoder().encode(markdown);
+  const filename = `${folder.name}.md`;
+  const docApi = spindle.databanks.documents;
 
   if (docApi) {
    let existingDoc = null;
    if (docApi.list) {
     let rawDocs = null;
-    for (const attempt of [
-     () => docApi.list(bankId, { userId: uId }, uId),
-     () => docApi.list(bankId, uId),
-     () => docApi.list({ databankId: bankId, id: bankId, userId: uId }, uId)
-    ]) {
-     try {
-      rawDocs = await attempt();
-      if (rawDocs) break;
-     } catch (e) {}
+    try {
+     rawDocs = await docApi.list(bankId, { limit: 100, userId: uId }, uId);
+    } catch (e2) {
+     rawDocs = await docApi.list(bankId, uId);
     }
-    const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.documents || rawDocs?.files || rawDocs?.data || []);
+    const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.data || rawDocs?.documents || []);
     existingDoc = docs.find(d => {
-     const dName = String(d.title || d.name || d.filename || "").toLowerCase().replace(/\.md$/, "");
+     const dName = String(d.filename || d.name || d.title || "").toLowerCase().replace(/\.md$/, "");
      return dName === folder.name.toLowerCase();
     });
    }
 
-   const docPayload = {
-    databankId: bankId,
-    title: folder.name,
-    name: `${folder.name}.md`,
-    filename: `${folder.name}.md`,
-    content: markdown,
-    userId: uId
-   };
-
-   if (existingDoc?.id && docApi.update) {
-    for (const attempt of [
-     () => docApi.update(bankId, existingDoc.id, docPayload, uId),
-     () => docApi.update(bankId, existingDoc.id, docPayload, { userId: uId }, uId),
-     () => docApi.update(existingDoc.id, docPayload, uId)
-    ]) {
-     try {
-      await attempt();
-      break;
-     } catch (e) {}
+   // Delete old version first since documents.update only renames files
+   if (existingDoc?.id && docApi.delete) {
+    try {
+     await docApi.delete(existingDoc.id, uId);
+    } catch (e3) {
+     await docApi.delete(bankId, existingDoc.id, uId);
     }
-   } else if (docApi.create) {
-    let created = false;
-    let lastErr = null;
-    for (const attempt of [
-     () => docApi.create(bankId, docPayload, uId),
-     () => docApi.create(bankId, docPayload, { userId: uId }, uId),
-     () => docApi.create(docPayload, uId),
-     () => docApi.create(docPayload, { userId: uId }, uId)
-    ]) {
-     try {
-      await attempt();
-      created = true;
-      break;
-     } catch (e) {
-      lastErr = e;
-     }
-    }
-    if (!created && lastErr) throw lastErr;
    }
-   console.log(`=== DATABANK SYNCED: ${folder.name} in Memory Folders (Bank ID: ${bankId}) ===`);
+
+   if (docApi.create) {
+    await docApi.create(bankId, {
+     filename,
+     mime_type: "text/markdown",
+     data: bytes,
+     userId: uId
+    }, uId);
+   }
+   console.log(`=== DATABANK SYNCED: ${filename} in Memory Folders (Bank ID: ${bankId}) ===`);
    return bankId;
   }
  } catch (err) {
@@ -607,6 +581,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
     const quietReq = {
      userId,
+     reasoning: { apiReasoning: false, reasoningEffort: "none" },
      messages: [
       {
        role: "system",
