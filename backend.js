@@ -96,8 +96,8 @@ async function getActiveCharacterInfo(chatId, userId) {
   try {
    const active = await spindle.chats.getActive(uId);
    if (active) {
-    charName = active.characterName || active.character_name || active.character?.name || active.name || charName;
-    charId = active.characterId || active.character_id || active.character?.id || null;
+    charName = active.characterName || active.character_name || active.character?.name || charName;
+    charId = active.character_id || active.characterId || active.character?.id || null;
    }
   } catch (e) {}
  }
@@ -107,7 +107,7 @@ async function getActiveCharacterInfo(chatId, userId) {
    const chatObj = await spindle.chats.get(cId, uId);
    if (chatObj) {
     charName = chatObj.characterName || chatObj.character_name || chatObj.character?.name || charName;
-    charId = chatObj.characterId || chatObj.character_id || chatObj.character?.id || null;
+    charId = chatObj.character_id || chatObj.characterId || chatObj.character?.id || null;
    }
   } catch (e) {}
  }
@@ -238,7 +238,14 @@ async function syncFolderToDatabank(folder, chatId, userId) {
   const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
 
   // Clean up old test databanks automatically
-  const legacyNames = ["memory folders", "toolkit folders", "tech & projects", "people & characters"];
+  const legacyNames = [
+   "memory folders",
+   "toolkit folders",
+   "tech & projects",
+   "people & characters",
+   "oct 23, 2026, 11:24:43 pm's archive",
+   "new databank"
+  ];
   if (spindle.databanks.delete) {
    for (const b of banks) {
     const bName = String(b.name || "").toLowerCase().trim();
@@ -262,36 +269,25 @@ async function syncFolderToDatabank(folder, chatId, userId) {
   let targetBank = banks.find(b => String(b.name || "").toLowerCase().trim() === targetBankName.toLowerCase());
 
   if (!targetBank && spindle.databanks.create) {
-   if (isPrivate) {
-    try {
-     targetBank = await spindle.databanks.create({
+    if (isPrivate && charInfo.id) {
+    targetBank = await spindle.databanks.create({
       name: targetBankName,
       description: targetBankDesc,
       scope: "character",
-      character_id: charInfo.id,
-      characterId: charInfo.id,
+      scope_id: charInfo.id,
       enabled: false,
       userId: uId
-     }, uId);
-    } catch (charBankErr) {
-     targetBank = await spindle.databanks.create({
+    }, uId);
+    } else {
+    targetBank = await spindle.databanks.create({
       name: targetBankName,
       description: targetBankDesc,
       scope: "global",
       enabled: false,
       userId: uId
-     }, uId);
-    }
-   } else {
-    targetBank = await spindle.databanks.create({
-     name: targetBankName,
-     description: targetBankDesc,
-     scope: "global",
-     enabled: false,
-     userId: uId
     }, uId);
-   }
-   console.log(`=== ARCHIVE CREATED: ${targetBankName} ===`);
+    }
+    console.log(`=== ARCHIVE CREATED: ${targetBankName} ===`);
   }
 
   const bankId = targetBank?.id || targetBank?.databankId || targetBank?.data?.id;
@@ -685,7 +681,6 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
     const quietReq = {
      userId,
-     reasoning: { apiReasoning: false, reasoningEffort: "none" },
      messages: [
       {
        role: "system",
