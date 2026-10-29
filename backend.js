@@ -178,6 +178,39 @@ function buildFolderMarkdown(folder) {
  return lines.join("\n");
 }
 
+function resolveCategoryBank(typeStr) {
+ const t = String(typeStr || "topic").toLowerCase().trim();
+ if (["project", "tech", "code", "extension", "tool"].includes(t)) {
+  return {
+   name: "Tech & Projects",
+   description: "Coding projects, extensions, and technical documentation managed by Assistant's Toolkit."
+  };
+ }
+ if (["game", "gaming", "playthrough"].includes(t)) {
+  return {
+   name: "Games",
+   description: "Video game playthroughs, loadouts, screenshots, and notes managed by Assistant's Toolkit."
+  };
+ }
+ if (["character", "person", "people", "npc"].includes(t)) {
+  return {
+   name: "People & Characters",
+   description: "Character profiles, relationships, and personal dossiers managed by Assistant's Toolkit."
+  };
+ }
+ if (["world", "lore", "place", "location", "setting"].includes(t)) {
+  return {
+   name: "World & Lore",
+   description: "Worldbuilding, locations, and setting lore managed by Assistant's Toolkit."
+  };
+ }
+ const cleanTitle = t.charAt(0).toUpperCase() + t.slice(1);
+ return {
+  name: `Folders: ${cleanTitle}`,
+  description: `Compiled ${cleanTitle} dossiers managed by Assistant's Toolkit.`
+ };
+}
+
 async function syncFolderToDatabank(folder, userId) {
  if (!spindle.databanks) return null;
  const uId = await ensureUserId(userId);
@@ -190,16 +223,49 @@ async function syncFolderToDatabank(folder, userId) {
   }
 
   const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
-  let targetBank = banks.find(b => String(b.name || "").toLowerCase() === "memory folders" || String(b.name || "").toLowerCase() === "toolkit folders");
+  const categoryInfo = resolveCategoryBank(folder.type);
+  const targetNameLower = categoryInfo.name.toLowerCase();
 
+  let targetBank = banks.find(b => String(b.name || "").toLowerCase() === targetNameLower);
+
+  // If target category bank doesn't exist yet, check if old "Memory Folders" is there and rename it!
+  if (!targetBank) {
+   const legacyBank = banks.find(b => {
+    const n = String(b.name || "").toLowerCase();
+    return n === "memory folders" || n === "toolkit folders";
+   });
+
+   if (legacyBank && spindle.databanks.update) {
+    const legacyId = legacyBank.id || legacyBank.databankId;
+    const updatePayload = {
+     name: categoryInfo.name,
+     description: categoryInfo.description,
+     scope: "global",
+     enabled: false,
+     is_enabled: false,
+     userId: uId
+    };
+    try {
+     targetBank = await spindle.databanks.update(legacyId, updatePayload, uId);
+    } catch (uErr) {
+     targetBank = await spindle.databanks.update({ id: legacyId, ...updatePayload }, uId);
+    }
+    if (!targetBank?.id) targetBank = { ...legacyBank, ...updatePayload, id: legacyId };
+    console.log(`=== DATABANK RENAMED: Memory Folders -> ${categoryInfo.name} ===`);
+   }
+  }
+
+  // Otherwise create a brand-new category Databank (with Global switch off by default)
   if (!targetBank && spindle.databanks.create) {
    targetBank = await spindle.databanks.create({
-    name: "Memory Folders",
-    description: "Compiled topic dossiers managed by Assistant's Toolkit.",
+    name: categoryInfo.name,
+    description: categoryInfo.description,
     scope: "global",
-    enabled: true,
+    enabled: false,
+    is_enabled: false,
     userId: uId
    }, uId);
+   console.log(`=== DATABANK CREATED: ${categoryInfo.name} ===`);
   }
 
   const bankId = targetBank?.id || targetBank?.databankId || targetBank?.data?.id;
@@ -226,7 +292,6 @@ async function syncFolderToDatabank(folder, userId) {
     });
    }
 
-   // Delete old version first since documents.update only renames files
    if (existingDoc?.id && docApi.delete) {
     try {
      await docApi.delete(existingDoc.id, uId);
@@ -243,7 +308,7 @@ async function syncFolderToDatabank(folder, userId) {
      userId: uId
     }, uId);
    }
-   console.log(`=== DATABANK SYNCED: ${filename} in Memory Folders (Bank ID: ${bankId}) ===`);
+   console.log(`=== DATABANK SYNCED: ${filename} in ${categoryInfo.name} (Bank ID: ${bankId}) ===`);
    return bankId;
   }
  } catch (err) {
