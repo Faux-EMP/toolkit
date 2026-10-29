@@ -182,7 +182,6 @@ async function syncFolderToDatabank(folder, userId) {
  if (!spindle.databanks) return null;
  const uId = await ensureUserId(userId);
  try {
-  // Support both list(options, userId) and list(userId) signatures
   let rawBanks = null;
   try {
    rawBanks = await spindle.databanks.list({ userId: uId }, uId);
@@ -214,10 +213,15 @@ async function syncFolderToDatabank(folder, userId) {
    let existingDoc = null;
    if (docApi.list) {
     let rawDocs = null;
-    try {
-     rawDocs = await docApi.list(bankId, uId);
-    } catch (e2) {
-     rawDocs = await docApi.list({ databankId: bankId, id: bankId, userId: uId }, uId);
+    for (const attempt of [
+     () => docApi.list(bankId, { userId: uId }, uId),
+     () => docApi.list(bankId, uId),
+     () => docApi.list({ databankId: bankId, id: bankId, userId: uId }, uId)
+    ]) {
+     try {
+      rawDocs = await attempt();
+      if (rawDocs) break;
+     } catch (e) {}
     }
     const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.documents || rawDocs?.files || rawDocs?.data || []);
     existingDoc = docs.find(d => {
@@ -236,17 +240,34 @@ async function syncFolderToDatabank(folder, userId) {
    };
 
    if (existingDoc?.id && docApi.update) {
-    try {
-     await docApi.update(bankId, existingDoc.id, docPayload, uId);
-    } catch (e3) {
-     await docApi.update(existingDoc.id, docPayload, uId);
+    for (const attempt of [
+     () => docApi.update(bankId, existingDoc.id, docPayload, uId),
+     () => docApi.update(bankId, existingDoc.id, docPayload, { userId: uId }, uId),
+     () => docApi.update(existingDoc.id, docPayload, uId)
+    ]) {
+     try {
+      await attempt();
+      break;
+     } catch (e) {}
     }
    } else if (docApi.create) {
-    try {
-     await docApi.create(bankId, docPayload, uId);
-    } catch (e4) {
-     await docApi.create(docPayload, uId);
+    let created = false;
+    let lastErr = null;
+    for (const attempt of [
+     () => docApi.create(bankId, docPayload, uId),
+     () => docApi.create(bankId, docPayload, { userId: uId }, uId),
+     () => docApi.create(docPayload, uId),
+     () => docApi.create(docPayload, { userId: uId }, uId)
+    ]) {
+     try {
+      await attempt();
+      created = true;
+      break;
+     } catch (e) {
+      lastErr = e;
+     }
     }
+    if (!created && lastErr) throw lastErr;
    }
    console.log(`=== DATABANK SYNCED: ${folder.name} in Memory Folders (Bank ID: ${bankId}) ===`);
    return bankId;
