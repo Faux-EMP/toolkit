@@ -13,7 +13,7 @@ const memoryFoldersCache = new Map();
 function resolveUserId(arg) {
  if (typeof arg === "string" && arg.trim()) return arg.trim();
  if (arg && typeof arg === "object") {
-  const candidate = arg.userId || arg.user_id || arg.uid || arg.id;
+  const candidate = arg.userId || arg.user_id || arg.uid || arg.user?.id;
   if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
  }
  return cachedUserId;
@@ -28,10 +28,41 @@ function resolveChatId(arg) {
  return cachedChatId;
 }
 
+function rememberUserId(uid) {
+ if (!uid || typeof uid !== "string" || !uid.trim()) return;
+ cachedUserId = uid.trim();
+ if (spindle.variables?.global?.set) {
+  Promise.resolve(spindle.variables.global.set("toolkit_cached_uid", cachedUserId)).catch(() => {});
+ }
+}
+
+async function ensureUserId( candidate ) {
+ const direct = resolveUserId(candidate);
+ if (direct) {
+  rememberUserId(direct);
+  return direct;
+ }
+ if (cachedUserId) return cachedUserId;
+ if (spindle.variables?.global?.get) {
+  try {
+   const raw = await spindle.variables.global.get("toolkit_cached_uid");
+   const val = (raw && typeof raw === "object") ? (raw.value ?? raw.data) : raw;
+   if (typeof val === "string" && val.trim()) {
+    cachedUserId = val.trim();
+    return cachedUserId;
+   }
+  } catch (e) {}
+ }
+ return cachedUserId;
+}
+
+// Preload saved userId immediately on worker startup
+ensureUserId().catch(() => {});
+
 for (const evt of ["MESSAGE_SENT", "CHAT_SWITCHED", "CHAT_CHANGED", "GENERATION_STARTED"]) {
  spindle.on(evt, (payload, uid) => {
   const resolvedUid = resolveUserId(uid) || resolveUserId(payload);
-  if (resolvedUid) cachedUserId = resolvedUid;
+  if (resolvedUid) rememberUserId(resolvedUid);
 
   const resolvedCid = resolveChatId(payload);
   if (resolvedCid) cachedChatId = resolvedCid;
@@ -44,9 +75,10 @@ for (const evt of ["MESSAGE_SENT", "CHAT_SWITCHED", "CHAT_CHANGED", "GENERATION_
 async function getActiveChatId(chatId, userId) {
  const direct = resolveChatId(chatId);
  if (direct) return direct;
+ const uId = await ensureUserId(userId);
  if (spindle.chats?.getActive) {
   try {
-   const active = await spindle.chats.getActive(userId);
+   const active = await spindle.chats.getActive(uId);
    if (active?.id) {
     cachedChatId = active.id;
     return active.id;
@@ -57,13 +89,14 @@ async function getActiveChatId(chatId, userId) {
 }
 
 async function getVaultMode(chatId, userId) {
- const cId = await getActiveChatId(chatId, userId);
+ const uId = await ensureUserId(userId);
+ const cId = await getActiveChatId(chatId, uId);
  if (cId && chatVaultModes.has(cId)) {
   return chatVaultModes.get(cId);
  }
  if (cId && spindle.variables?.chat?.get) {
   try {
-   const raw = await spindle.variables.chat.get(cId, "vault_mode", userId);
+   const raw = await spindle.variables.chat.get(cId, "vault_mode", uId);
    const val = (raw && typeof raw === "object") ? (raw.value ?? raw.data) : raw;
    if (val === "all" || val === "strict") {
     chatVaultModes.set(cId, val);
@@ -76,7 +109,7 @@ async function getVaultMode(chatId, userId) {
 }
 
 async function setVaultMode(chatId, userId, targetMode) {
- const uId = resolveUserId(userId);
+ const uId = await ensureUserId(userId);
  const cId = await getActiveChatId(chatId, uId);
  const current = await getVaultMode(cId, uId);
 
@@ -112,7 +145,7 @@ async function setVaultMode(chatId, userId, targetMode) {
 
 // === MEMORY FOLDERS SYSTEM (Global Storage + Native Databank Sync) ===
 async function getGlobalFolders(userId) {
- const uId = resolveUserId(userId);
+ const uId = await ensureUserId(userId);
  if (spindle.variables?.global?.get) {
   try {
    const raw = await spindle.variables.global.get("toolkit_folders", uId);
@@ -147,8 +180,16 @@ function buildFolderMarkdown(folder) {
 
 async function syncFolderToDatabank(folder, userId) {
  if (!spindle.databanks) return null;
+ const uId = await ensureUserId(userId);
  try {
-  const rawBanks = await spindle.databanks.list(userId);
+  // Support both list(options, userId) and list(userId) signatures
+  let rawBanks = null;
+  try {
+   rawBanks = await spindle.databanks.list({ userId: uId }, uId);
+  } catch (e1) {
+   rawBanks = await spindle.databanks.list(uId);
+  }
+
   const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
   let targetBank = banks.find(b => String(b.name || "").toLowerCase() === "memory folders" || String(b.name || "").toLowerCase() === "toolkit folders");
 
@@ -157,11 +198,13 @@ async function syncFolderToDatabank(folder, userId) {
     name: "Memory Folders",
     description: "Compiled topic dossiers managed by Assistant's Toolkit.",
     scope: "global",
-    userId
-   }, userId);
+    is_enabled: true,
+    enabled: true,
+    userId: uId
+   }, uId);
   }
 
-  const bankId = targetBank?.id || targetBank?.databankId;
+  const bankId = targetBank?.id || targetBank?.databankId || targetBank?.data?.id;
   if (!bankId) return null;
 
   const markdown = buildFolderMarkdown(folder);
@@ -170,7 +213,12 @@ async function syncFolderToDatabank(folder, userId) {
   if (docApi) {
    let existingDoc = null;
    if (docApi.list) {
-    const rawDocs = await docApi.list(bankId, userId);
+    let rawDocs = null;
+    try {
+     rawDocs = await docApi.list(bankId, uId);
+    } catch (e2) {
+     rawDocs = await docApi.list({ databankId: bankId, id: bankId, userId: uId }, uId);
+    }
     const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.documents || rawDocs?.files || rawDocs?.data || []);
     existingDoc = docs.find(d => {
      const dName = String(d.title || d.name || d.filename || "").toLowerCase().replace(/\.md$/, "");
@@ -178,34 +226,39 @@ async function syncFolderToDatabank(folder, userId) {
     });
    }
 
+   const docPayload = {
+    databankId: bankId,
+    title: folder.name,
+    name: `${folder.name}.md`,
+    filename: `${folder.name}.md`,
+    content: markdown,
+    userId: uId
+   };
+
    if (existingDoc?.id && docApi.update) {
-    await docApi.update(bankId, existingDoc.id, {
-     title: folder.name,
-     name: `${folder.name}.md`,
-     filename: `${folder.name}.md`,
-     content: markdown,
-     userId
-    }, userId);
+    try {
+     await docApi.update(bankId, existingDoc.id, docPayload, uId);
+    } catch (e3) {
+     await docApi.update(existingDoc.id, docPayload, uId);
+    }
    } else if (docApi.create) {
-    await docApi.create(bankId, {
-     title: folder.name,
-     name: `${folder.name}.md`,
-     filename: `${folder.name}.md`,
-     content: markdown,
-     userId
-    }, userId);
+    try {
+     await docApi.create(bankId, docPayload, uId);
+    } catch (e4) {
+     await docApi.create(docPayload, uId);
+    }
    }
-   console.log(`=== DATABANK SYNCED: ${folder.name} in Memory Folders ===`);
+   console.log(`=== DATABANK SYNCED: ${folder.name} in Memory Folders (Bank ID: ${bankId}) ===`);
    return bankId;
   }
  } catch (err) {
-  console.warn("Databank sync notice:", err.message);
+  console.warn("Databank sync notice:", err.message, "userId:", uId);
  }
  return null;
 }
 
-async function saveMemoryFolder({ chatId, userId, folderName, folderType, description, facts }) {
- const uId = resolveUserId(userId);
+async function saveMemoryFolder({ chatId, userId, folderName, folderType, description, facts, replaceFacts }) {
+ const uId = await ensureUserId(userId);
  const cleanName = String(folderName || "").trim();
  if (!cleanName) return null;
 
@@ -226,6 +279,11 @@ async function saveMemoryFolder({ chatId, userId, folderName, folderType, descri
  const incomingFacts = Array.isArray(facts)
   ? facts
   : String(facts || "").split(/\n|\|/).map(s => s.trim()).filter(Boolean);
+
+ // If replaceFacts is true, wipe the old facts array clean before inserting the fresh list
+ if (replaceFacts && incomingFacts.length > 0) {
+  existing.facts = [];
+ }
 
  const seen = new Set((existing.facts || []).map(f => String(f).toLowerCase().trim()));
  for (const f of incomingFacts) {
@@ -474,7 +532,11 @@ spindle.registerTool({
    folder_facts: {
     type: "array",
     items: { type: "string" },
-    description: "Optional: array of detailed, clear bullet-point facts to append into the specified Memory Folder."
+    description: "Optional: array of detailed, clear bullet-point facts to save into the specified Memory Folder."
+   },
+   folder_replace: {
+    type: "boolean",
+    description: "Optional: set to true to completely replace the folder's existing facts list with folder_facts instead of appending."
    }
   },
   required: ["query"]
@@ -502,7 +564,7 @@ spindle.registerTool({
 });
 
 spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
- const userId = resolveUserId(eventUserId) || resolveUserId(payload);
+ const userId = await ensureUserId(resolveUserId(eventUserId) || resolveUserId(payload));
 
  if (payload.toolName === "web_search") {
   const query = String(payload.args?.query || "").trim();
@@ -584,7 +646,8 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
    folderName,
    folderType: payload.args?.folder_type,
    description: payload.args?.folder_description,
-   facts: payload.args?.folder_facts
+   facts: payload.args?.folder_facts,
+   replaceFacts: Boolean(payload.args?.folder_replace)
   });
   if (savedFolder) {
    results.push(`=== FOLDER UPDATED: ${savedFolder.name} ===\n` + JSON.stringify({
