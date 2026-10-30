@@ -558,45 +558,66 @@ function extractAttachmentIds(m) {
 
 const imageVisionMemCache = new Map();
 
+function isBlindVisionResponse(text) {
+  if (!text) return true;
+  return /\b(cannot see|can't see|no image|not attached|wasn't attached|upload or attach|provide the image|unable to view|don't see an image|no screenshot)\b/i.test(text);
+}
+
+let lastVisionScanAt = 0;
+
 async function getVisionCacheMap(userId) {
-  const uId = await ensureUserId(userId);
-  if (spindle.variables?.global?.get) {
-    try {
-      const raw = await spindle.variables.global.get("toolkit_image_cache", uId);
-      const unwrapped = (raw && typeof raw === "object" && ("value" in raw || "data" in raw))
-        ? (raw.value ?? raw.data)
-        : raw;
-      const parsed = typeof unwrapped === "string" ? JSON.parse(unwrapped) : unwrapped;
+  try {
+    const raw = await spindle.variables.global.get("toolkit_image_cache", userId);
+    if (raw) {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
       if (parsed && typeof parsed === "object") {
+        const clean = {};
         for (const [k, v] of Object.entries(parsed)) {
-          imageVisionMemCache.set(k, v);
+          if (typeof v === "string" && !isBlindVisionResponse(v)) {
+            clean[k] = v;
+            imageVisionMemCache.set(k, v);
+          } else {
+            imageVisionMemCache.delete(k);
+          }
         }
+        return clean;
       }
-    } catch (_) { }
+    }
+  } catch (_) { }
+  const fallback = {};
+  for (const [k, v] of imageVisionMemCache.entries()) {
+    if (!isBlindVisionResponse(v)) fallback[k] = v;
   }
-  return Object.fromEntries(imageVisionMemCache.entries());
+  return fallback;
 }
 
 async function saveVisionCacheEntry(imageId, description, userId) {
-  const uId = await ensureUserId(userId);
+  if (isBlindVisionResponse(description)) return;
   imageVisionMemCache.set(imageId, description);
-  if (spindle.variables?.global?.set) {
-    try {
-      const current = await getVisionCacheMap(uId);
-      current[imageId] = description;
-      await spindle.variables.global.set("toolkit_image_cache", JSON.stringify(current), uId);
-    } catch (_) { }
-  }
+  try {
+    const current = await getVisionCacheMap(userId);
+    current[imageId] = description;
+    await spindle.variables.global.set("toolkit_image_cache", JSON.stringify(current), userId);
+  } catch (_) { }
 }
 
 async function analyzeImageById(imageId, userId, contextHint = "") {
   if (!imageId) return null;
-  if (imageVisionMemCache.has(imageId)) return imageVisionMemCache.get(imageId);
+  if (imageVisionMemCache.has(imageId)) {
+    const cached = imageVisionMemCache.get(imageId);
+    if (!isBlindVisionResponse(cached)) return cached;
+    imageVisionMemCache.delete(imageId);
+  }
 
   const persisted = await getVisionCacheMap(userId);
-  if (persisted[imageId]) return persisted[imageId];
+  if (persisted[imageId] && !isBlindVisionResponse(persisted[imageId])) {
+    return persisted[imageId];
+  }
 
-  if (!spindle.images?.readBinary || !spindle.generate?.quiet) return null;
+  if (Date.now() - lastVisionScanAt < 15000) return null;
+  lastVisionScanAt = Date.now();
+
+  if (!spindle.images?.readBinary || !spindle.generate) return null;
 
   try {
     let mimeType = "image/png";
@@ -619,83 +640,105 @@ async function analyzeImageById(imageId, userId, contextHint = "") {
       id: imageId,
       image_id: imageId,
       mime_type: mimeType,
+      mimeType: mimeType,
+      type: "image",
       width: imgMeta?.width,
       height: imgMeta?.height,
       data: base64,
+      base64: base64,
       url: dataUrl
+    };
+
+    let connId = cachedConnectionId;
+    if (!connId && spindle.connections?.list) {
+      try {
+        const conns = await spindle.connections.list(userId);
+        const list = Array.isArray(conns) ? conns : (conns?.data || []);
+        const chosen = list.find(c => c.is_default || c.isDefault) || list.find(c => c.has_api_key) || list[0];
+        if (chosen?.id) {
+          connId = chosen.id;
+          cachedConnectionId = connId;
+        }
+      } catch (_) { }
+    }
+
+    const multimodalPayload = {
+      userId,
+      connection_id: connId,
+      connectionId: connId,
+      apiReasoning: false,
+      reasoningEffort: "none",
+      attachments: [attObj],
+      images: [attObj],
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: promptText },
+            { type: "image_url", image_url: { url: dataUrl } }
+          ],
+          attachments: [attObj],
+          images: [attObj],
+          extra: { attachments: [attObj] }
+        }
+      ]
     };
 
     await new Promise(r => setTimeout(r, 2000));
     let visionText = "";
-    try {
-      const reqA = {
-        userId,
-        apiReasoning: false,
-        reasoningEffort: "none",
-        attachments: [attObj],
-        images: [attObj],
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: promptText },
-              { type: "image_url", image_url: { url: dataUrl } }
-            ],
-            attachments: [attObj],
-            extra: { attachments: [attObj] }
-          }
-        ]
-      };
-      let connId = cachedConnectionId;
-      if (!connId && spindle.connections?.list) {
-        try {
-          const conns = await spindle.connections.list(userId);
-          const list = Array.isArray(conns) ? conns : (conns?.data || []);
-          const chosen = list.find(c => c.is_default || c.isDefault) || list.find(c => c.has_api_key) || list[0];
-          if (chosen?.id) {
-            connId = chosen.id;
-            cachedConnectionId = connId;
-          }
-        } catch (_) { }
-      }
-      if (connId) {
-        reqA.connection_id = connId;
-        reqA.connectionId = connId;
-      }
+    const diagErrors = [];
 
+    try {
       let res = null;
-      try {
-        res = await spindle.generate.quiet(reqA, userId);
-      } catch (_) {
-        const reqB = {
-          ...reqA,
-          messages: [
-            {
-              role: "user",
-              content: promptText,
-              attachments: [attObj],
-              images: [attObj],
-              extra: { attachments: [attObj] }
-            }
-          ]
-        };
-        res = await spindle.generate.quiet(reqB, userId);
+      if (typeof spindle.generate.raw === "function") {
+        try {
+          res = await spindle.generate.raw(multimodalPayload, userId);
+        } catch (eRaw) {
+          diagErrors.push(`raw: ${eRaw.message}`);
+        }
+      }
+      if (!res && typeof spindle.generate.quiet === "function") {
+        try {
+          res = await spindle.generate.quiet(multimodalPayload, userId);
+        } catch (eQuiet) {
+          diagErrors.push(`quiet(array): ${eQuiet.message}`);
+        }
+      }
+      if (!res && typeof spindle.generate.quiet === "function") {
+        try {
+          res = await spindle.generate.quiet({
+            ...multimodalPayload,
+            messages: [
+              {
+                role: "user",
+                content: promptText,
+                attachments: [attObj],
+                images: [attObj],
+                extra: { attachments: [attObj] }
+              }
+            ]
+          }, userId);
+        } catch (eQuiet2) {
+          diagErrors.push(`quiet(str): ${eQuiet2.message}`);
+        }
       }
 
       visionText = typeof res === "string"
         ? res
-        : (res?.content || res?.text || res?.message?.content || res?.choices?.[0]?.message?.content || "");
+        : (res?.content || res?.text || res?.message?.content || res?.choices?.[0]?.message?.content || JSON.stringify(res || ""));
       visionText = String(visionText || "").trim();
     } finally {
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    const looksBlind = !visionText || /\b(cannot see|can't see|no image|not attached|provide the image|unable to view)\b/i.test(visionText);
-    if (!looksBlind) {
+    if (!isBlindVisionResponse(visionText)) {
       await saveVisionCacheEntry(imageId, visionText, userId);
       return visionText;
     }
-    return `[Vision attempt returned no-image notice: ${visionText.slice(0, 180)}]`;
+
+    const quietSrc = String(spindle.generate?.quiet || "").slice(0, 300);
+    const rawSrc = String(spindle.generate?.raw || "").slice(0, 300);
+    return `[Vision blind response. Errors: ${diagErrors.join(" | ") || "none"} | quietSrc: ${quietSrc} | rawSrc: ${rawSrc}]`;
   } catch (err) {
     return `[Vision error: ${err.message}]`;
   }
