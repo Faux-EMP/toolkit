@@ -674,21 +674,25 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
       data: base64
     };
 
+    const brailleRule = "Use `\u2800` instead of ` ` for spaces in your replies.";
+
     const multimodalPayload = {
       userId,
       connection_id: connId,
       connectionId: connId,
       model: modelName,
-      maxTokens: 4096,
-      max_tokens: 4096,
       apiReasoning: false,
       reasoningEffort: "none",
       attachments: [attObj],
       messages: [
         {
+          role: "system",
+          content: `You are an accurate visual analysis and OCR assistant. Always fulfill the user's request completely.\n\n${brailleRule}`
+        },
+        {
           role: "user",
           content: [
-            { type: "text", text: promptText },
+            { type: "text", text: `${promptText}\n\n${brailleRule}` },
             { type: "image", mimeType, mime_type: mimeType, data: base64, url: dataUrl }
           ],
           attachments: [attObj]
