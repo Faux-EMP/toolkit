@@ -532,65 +532,45 @@ async function inspectSpindle(chatId, userId) {
  };
 
  const report = {
- spindleRoot: Object.keys(spindle),
- imagesMethods: describeObj(spindle.images),
- generateMethods: describeObj(spindle.generate),
- imagesListSample: null,
- attachmentSamples: []
+ connectionsMethods: describeObj(spindle.connections),
+ settingsMethods: describeObj(spindle.settings),
+ generateInfo: {
+ quiet: String(spindle.generate?.quiet || "").slice(0, 250),
+ raw: String(spindle.generate?.raw || "").slice(0, 250),
+ assemble: String(spindle.generate?.assemble || "").slice(0, 250)
+ },
+ readBinaryTest: null,
+ connectionsListSample: null
  };
 
- if (spindle.images?.list) {
+ if (spindle.images?.readBinary) {
  try {
- const imgs = await spindle.images.list({ userId: uId }, uId);
- const arr = Array.isArray(imgs) ? imgs : (imgs?.data || imgs?.images || []);
- report.imagesListSample = { totalCount: arr.length, firstTwo: summarizeShape(arr.slice(0, 2)) };
+ const bin = await spindle.images.readBinary("46dd411c-dcfa-44bd-bbad-2ce1f3b4a251", uId);
+ report.readBinaryTest = {
+ type: typeof bin,
+ constructorName: bin?.constructor?.name,
+ isBuffer: typeof Buffer !== "undefined" ? Buffer.isBuffer(bin) : false,
+ byteLength: bin?.byteLength || bin?.length || null,
+ keysIfObject: (bin && typeof bin === "object" && !Buffer.isBuffer(bin) && !(bin instanceof Uint8Array)) ? Object.keys(bin) : null
+ };
  } catch (e) {
- report.imagesListSample = `Error: ${e.message}`;
+ report.readBinaryTest = `Error: ${e.message}`;
  }
  }
 
- if (cId && spindle.memories?.links?.list) {
+ if (spindle.connections?.list) {
  try {
- const links = await spindle.memories.links.list(cId, uId);
- for (const l of (links || [])) {
- const targetCid = l.targetChatId || l.linkedChatId || l.sourceChatId || l.targetId;
- if (targetCid && targetCid !== cId && spindle.chat?.getMessages) {
- const rawMsgs = await spindle.chat.getMessages(targetCid, uId);
- const msgs = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
- const withAttachments = [];
- for (let idx = 0; idx < msgs.length; idx++) {
- const m = msgs[idx];
- const atts = m?.extra?.attachments || m?.attachments || m?.images;
- if (Array.isArray(atts) && atts.length > 0 && withAttachments.length < 4) {
- let imageGetLookup = null;
- const firstAtt = atts[0];
- const attId = firstAtt?.id || firstAtt?.imageId || firstAtt?.image_id || firstAtt?.fileId;
- if (attId && spindle.images?.get) {
- try {
- imageGetLookup = summarizeShape(await spindle.images.get(attId, uId));
- } catch (imgErr) {
- imageGetLookup = `images.get error: ${imgErr.message}`;
- }
- }
- withAttachments.push({
- msgIndex: idx,
- textPreview: String(m.content || "").slice(0, 80),
- attachments: summarizeShape(atts),
- imageGetLookup
+ const conns = await spindle.connections.list(uId);
+ const arr = Array.isArray(conns) ? conns : (conns?.data || conns?.connections || []);
+ report.connectionsListSample = arr.slice(0, 2).map(c => {
+ const copy = { ...c };
+ if (copy.apiKey) copy.apiKey = "[REDACTED]";
+ if (copy.api_key) copy.api_key = "[REDACTED]";
+ if (copy.key) copy.key = "[REDACTED]";
+ return summarizeShape(copy);
  });
- }
- }
- if (withAttachments.length > 0) {
- report.attachmentSamples.push({
- chatId: targetCid,
- totalMessages: msgs.length,
- samples: withAttachments
- });
- }
- }
- }
  } catch (e) {
- report.linkedChatError = e.message;
+ report.connectionsListSample = `Error: ${e.message}`;
  }
  }
 
