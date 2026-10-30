@@ -560,7 +560,7 @@ const imageVisionMemCache = new Map();
 
 function isBlindVisionResponse(text) {
   if (!text) return true;
-  return /\b(cannot see|can't see|no image|not attached|wasn't attached|upload or attach|provide the image|unable to view|don't see an image|no screenshot)\b/i.test(text);
+  return /\b(cannot see|can't see|no image|not attached|wasn't attached|didn't attach|upload or attach|provide the image|unable to view|don't see an image|no screenshot|empty response|returned thinking)\b/i.test(text);
 }
 
 let lastVisionScanAt = 0;
@@ -641,7 +641,7 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
     const base64 = Buffer.from(bin).toString("base64");
     const dataUrl = `data:${mimeType};base64,${base64}`;
 
-    const promptText = `Examine this attached screenshot carefully. Transcribe ALL visible text, numbers, stats, part names, credits, and UI labels verbatim, and describe what is shown.${contextHint ? `\nContext caption: "${contextHint.slice(0, 200)}"` : ""}`;
+    const promptText = "Examine this video game interface screenshot. List all visible UI text, numbers, stats, part names, credits, and labels accurately, and briefly describe the screen layout.";
 
     let connId = cachedConnectionId;
     let modelName = cachedModelName;
@@ -683,6 +683,8 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
       connection_id: connId,
       connectionId: connId,
       model: modelName,
+      max_tokens: 4096,
+      reasoning_effort: "low",
       apiReasoning: false,
       reasoningEffort: "none",
       attachments: [attObj],
