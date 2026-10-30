@@ -503,16 +503,16 @@ function getChunkEndIdx(c) {
 function summarizeShape(val, depth = 0) {
  if (val === null || val === undefined) return val;
  if (typeof val === "string") {
-  return val.length > 100 ? `${val.slice(0, 80)}... [string length: ${val.length}]` : val;
+ return val.length > 120 ? `${val.slice(0, 100)}... [string length: ${val.length}]` : val;
  }
  if (typeof val !== "object") return val;
- if (depth > 2) return Array.isArray(val) ? `[Array(${val.length})]` : "[Object]";
+ if (depth > 5) return Array.isArray(val) ? `[Array(${val.length})]` : "[Object]";
  if (Array.isArray(val)) {
-  return val.slice(0, 3).map(item => summarizeShape(item, depth + 1));
+ return val.slice(0, 5).map(item => summarizeShape(item, depth + 1));
  }
  const out = {};
  for (const k of Object.keys(val)) {
-  out[k] = summarizeShape(val[k], depth + 1);
+ out[k] = summarizeShape(val[k], depth + 1);
  }
  return out;
 }
@@ -522,65 +522,76 @@ async function inspectSpindle(chatId, userId) {
  const cId = await getActiveChatId(chatId, uId);
 
  const describeObj = (obj) => {
-  if (!obj) return null;
-  const info = {};
-  for (const key of Object.keys(obj)) {
-   const val = obj[key];
-   if (val && typeof val === "object") {
-    info[key] = Object.keys(val);
-   } else {
-    info[key] = typeof val;
-   }
-  }
-  return info;
+ if (!obj) return null;
+ const info = {};
+ for (const key of Object.keys(obj)) {
+ const val = obj[key];
+ info[key] = (val && typeof val === "object") ? Object.keys(val) : typeof val;
+ }
+ return info;
  };
 
  const report = {
-  media: describeObj(spindle.media),
-  uploads: describeObj(spindle.uploads),
-  images: describeObj(spindle.images),
-  imagesListSample: null,
-  linkedChatMediaSamples: []
+ spindleRoot: Object.keys(spindle),
+ imagesMethods: describeObj(spindle.images),
+ generateMethods: describeObj(spindle.generate),
+ imagesListSample: null,
+ attachmentSamples: []
  };
 
  if (spindle.images?.list) {
-  try {
-   const imgs = await spindle.images.list({ userId: uId }, uId);
-   const arr = Array.isArray(imgs) ? imgs : (imgs?.data || imgs?.images || []);
-   report.imagesListSample = { totalCount: arr.length, firstTwo: summarizeShape(arr.slice(0, 2)) };
-  } catch (e) {
-   report.imagesListSample = `Error: ${e.message}`;
-  }
+ try {
+ const imgs = await spindle.images.list({ userId: uId }, uId);
+ const arr = Array.isArray(imgs) ? imgs : (imgs?.data || imgs?.images || []);
+ report.imagesListSample = { totalCount: arr.length, firstTwo: summarizeShape(arr.slice(0, 2)) };
+ } catch (e) {
+ report.imagesListSample = `Error: ${e.message}`;
+ }
  }
 
  if (cId && spindle.memories?.links?.list) {
-  try {
-   const links = await spindle.memories.links.list(cId, uId);
-   for (const l of (links || [])) {
-    const targetCid = l.targetChatId || l.linkedChatId || l.sourceChatId || l.targetId;
-    if (targetCid && targetCid !== cId && spindle.chat?.getMessages) {
-     const rawMsgs = await spindle.chat.getMessages(targetCid, uId);
-     const msgs = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
-     const interesting = [];
-     msgs.forEach((m, idx) => {
-      const keys = Object.keys(m || {});
-      const hasExtra = keys.some(k => !["id", "role", "name", "content", "created_at", "updated_at", "timestamp", "chat_id"].includes(k));
-      const contentNonString = typeof m.content !== "string";
-      const looksLikeImg = JSON.stringify(m).match(/image|media|upload|attach|data:|base64|url|file/i);
-      if ((hasExtra || contentNonString || looksLikeImg || idx < 6) && interesting.length < 8) {
-       interesting.push({ msgIndex: idx, keys, sample: summarizeShape(m) });
-      }
-     });
-     report.linkedChatMediaSamples.push({
-      chatId: targetCid,
-      totalMessages: msgs.length,
-      samples: interesting
-     });
-    }
-   }
-  } catch (e) {
-   report.linkedChatError = e.message;
-  }
+ try {
+ const links = await spindle.memories.links.list(cId, uId);
+ for (const l of (links || [])) {
+ const targetCid = l.targetChatId || l.linkedChatId || l.sourceChatId || l.targetId;
+ if (targetCid && targetCid !== cId && spindle.chat?.getMessages) {
+ const rawMsgs = await spindle.chat.getMessages(targetCid, uId);
+ const msgs = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
+ const withAttachments = [];
+ for (let idx = 0; idx < msgs.length; idx++) {
+ const m = msgs[idx];
+ const atts = m?.extra?.attachments || m?.attachments || m?.images;
+ if (Array.isArray(atts) && atts.length > 0 && withAttachments.length < 4) {
+ let imageGetLookup = null;
+ const firstAtt = atts[0];
+ const attId = firstAtt?.id || firstAtt?.imageId || firstAtt?.image_id || firstAtt?.fileId;
+ if (attId && spindle.images?.get) {
+ try {
+ imageGetLookup = summarizeShape(await spindle.images.get(attId, uId));
+ } catch (imgErr) {
+ imageGetLookup = `images.get error: ${imgErr.message}`;
+ }
+ }
+ withAttachments.push({
+ msgIndex: idx,
+ textPreview: String(m.content || "").slice(0, 80),
+ attachments: summarizeShape(atts),
+ imageGetLookup
+ });
+ }
+ }
+ if (withAttachments.length > 0) {
+ report.attachmentSamples.push({
+ chatId: targetCid,
+ totalMessages: msgs.length,
+ samples: withAttachments
+ });
+ }
+ }
+ }
+ } catch (e) {
+ report.linkedChatError = e.message;
+ }
  }
 
  return JSON.stringify(report, null, 2);
