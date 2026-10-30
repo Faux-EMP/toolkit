@@ -932,10 +932,21 @@ const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || 
 const attTag = formatAttachmentTags(m);
 const hasAtt = Boolean(attTag);
 
-const nextMsg = chatMessages[idx + 1];
-const nextText = nextMsg ? (typeof nextMsg.content === "string" ? nextMsg.content : (nextMsg.mes || nextMsg.text || "")) : "";
+const followUps = [];
+if (hasAtt) {
+for (let offset = 1; offset <= 3; offset++) {
+const fMsg = chatMessages[idx + offset];
+if (!fMsg) break;
+const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
+const fTime = formatTime(getMsgTimestamp(fMsg)) || "";
+const fText = typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || "");
+followUps.push({ msgIdx: idx + offset, role: fRole, time: fTime, text: fText });
+if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
+}
+}
+const followUpTextCombined = followUps.map(f => f.text).join(" ");
 
-const combined = `${msgTime} ${attTag} ${msgText} ${hasAtt ? nextText : ""}`;
+const combined = `${msgTime} ${attTag} ${msgText} ${followUpTextCombined}`;
 let score = countKeywordMatches(combined, keywords);
 if (isImgQuery && hasAtt) score += keywords.length + 2;
 
@@ -945,10 +956,8 @@ if (score >= minRequired) {
 const role = m.role || m.name || (m.is_user ? "User" : "Assistant");
 let formatted = `[Message #${idx} | Time: ${msgTime} | ${role}]${attTag ? ` ${attTag}` : ""}\n${msgText}`;
 
-if (hasAtt && nextMsg) {
-const nextRole = nextMsg.role || nextMsg.name || (nextMsg.is_user ? "User" : "Assistant");
-const nextTime = formatTime(getMsgTimestamp(nextMsg)) || "";
-formatted += `\n ↳ [Paired Reply #${idx + 1} | Time: ${nextTime} | ${nextRole}]\n${nextText}`;
+for (const f of followUps) {
+formatted += `\n ↳ [Paired #${f.msgIdx} | Time: ${f.time} | ${f.role}]\n${f.text}`;
 }
 
 scoredMsgs.push({
