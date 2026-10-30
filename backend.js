@@ -31,7 +31,7 @@ function rememberUserId(uid) {
   if (!uid || typeof uid !== "string" || !uid.trim()) return;
   cachedUserId = uid.trim();
   if (spindle.variables?.global?.set) {
-    Promise.resolve(spindle.variables.global.set("toolkit_cached_uid", cachedUserId)).catch(() => {});
+    Promise.resolve(spindle.variables.global.set("toolkit_cached_uid", cachedUserId)).catch(() => { });
   }
 }
 
@@ -50,12 +50,12 @@ async function ensureUserId(candidate) {
         cachedUserId = val.trim();
         return cachedUserId;
       }
-    } catch (e) {}
+    } catch (e) { }
   }
   return cachedUserId;
 }
 
-ensureUserId().catch(() => {});
+ensureUserId().catch(() => { });
 
 for (const evt of ["MESSAGE_SENT", "CHAT_SWITCHED", "CHAT_CHANGED", "GENERATION_STARTED"]) {
   spindle.on(evt, (payload, uid) => {
@@ -81,7 +81,7 @@ async function getActiveChatId(chatId, userId) {
         cachedChatId = active.id;
         return active.id;
       }
-    } catch (e) {}
+    } catch (e) { }
   }
   return cachedChatId;
 }
@@ -99,7 +99,7 @@ async function getActiveCharacterInfo(chatId, userId) {
         charName = active.characterName || active.character_name || active.character?.name || charName;
         charId = active.character_id || active.characterId || active.character?.id || null;
       }
-    } catch (e) {}
+    } catch (e) { }
   }
 
   if (!charId && cId && spindle.chats?.get) {
@@ -109,7 +109,7 @@ async function getActiveCharacterInfo(chatId, userId) {
         charName = chatObj.characterName || chatObj.character_name || chatObj.character?.name || charName;
         charId = chatObj.character_id || chatObj.characterId || chatObj.character?.id || null;
       }
-    } catch (e) {}
+    } catch (e) { }
   }
 
   return { name: String(charName || "Assistant").trim(), id: charId };
@@ -130,7 +130,7 @@ async function getVaultMode(chatId, userId) {
         lastKnownVaultMode = val;
         return val;
       }
-    } catch (e) {}
+    } catch (e) { }
   }
   return cId ? (chatVaultModes.get(cId) || lastKnownVaultMode) : lastKnownVaultMode;
 }
@@ -161,9 +161,9 @@ async function setVaultMode(chatId, userId, targetMode) {
     : "Strict Mode (Searching ONLY attached Vaults in this chat)";
 
   if (spindle.toast?.info) {
-    try { spindle.toast.info(`Toolkit: ${label}`); } catch (e) {}
+    try { spindle.toast.info(`Toolkit: ${label}`); } catch (e) { }
   } else if (typeof spindle.toast === "function") {
-    try { spindle.toast(`Toolkit: ${label}`); } catch (e) {}
+    try { spindle.toast(`Toolkit: ${label}`); } catch (e) { }
   }
 
   console.log(`=== VAULT MODE CHANGED (Chat: ${cId || "active"}) -> ${nextMode} ===`);
@@ -185,7 +185,7 @@ async function getGlobalFolders(userId) {
           memoryFoldersCache.set(k, v);
         }
       }
-    } catch (e) {}
+    } catch (e) { }
   }
   return Object.fromEntries(memoryFoldersCache.entries());
 }
@@ -252,7 +252,7 @@ async function syncFolderToDatabank(folder, chatId, userId) {
         if (legacyNames.includes(bName)) {
           const bId = b.id || b.databankId;
           if (bId) {
-            try { await spindle.databanks.delete(bId, uId); } catch (delErr) {}
+            try { await spindle.databanks.delete(bId, uId); } catch (delErr) { }
             console.log(`=== DELETED LEGACY DATABANK: ${b.name} ===`);
           }
         }
@@ -572,7 +572,7 @@ async function getVisionCacheMap(userId) {
           imageVisionMemCache.set(k, v);
         }
       }
-    } catch (_) {}
+    } catch (_) { }
   }
   return Object.fromEntries(imageVisionMemCache.entries());
 }
@@ -585,7 +585,7 @@ async function saveVisionCacheEntry(imageId, description, userId) {
       const current = await getVisionCacheMap(uId);
       current[imageId] = description;
       await spindle.variables.global.set("toolkit_image_cache", JSON.stringify(current), uId);
-    } catch (_) {}
+    } catch (_) { }
   }
 }
 
@@ -605,7 +605,7 @@ async function analyzeImageById(imageId, userId, contextHint = "") {
       try {
         imgMeta = await spindle.images.get(imageId, userId);
         if (imgMeta?.mime_type || imgMeta?.mimeType) mimeType = imgMeta.mime_type || imgMeta.mimeType;
-      } catch (_) {}
+      } catch (_) { }
     }
 
     const bin = await spindle.images.readBinary(imageId, userId);
@@ -646,7 +646,22 @@ async function analyzeImageById(imageId, userId, contextHint = "") {
           }
         ]
       };
-      if (cachedConnectionId) reqA.connection_id = cachedConnectionId;
+      let connId = cachedConnectionId;
+      if (!connId && spindle.connections?.list) {
+        try {
+          const conns = await spindle.connections.list(userId);
+          const list = Array.isArray(conns) ? conns : (conns?.data || []);
+          const chosen = list.find(c => c.is_default || c.isDefault) || list.find(c => c.has_api_key) || list[0];
+          if (chosen?.id) {
+            connId = chosen.id;
+            cachedConnectionId = connId;
+          }
+        } catch (_) { }
+      }
+      if (connId) {
+        reqA.connection_id = connId;
+        reqA.connectionId = connId;
+      }
 
       let res = null;
       try {
@@ -840,6 +855,14 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
             }
           ]
         };
+        if (!cachedConnectionId && spindle.connections?.list) {
+          try {
+            const conns = await spindle.connections.list(userId);
+            const list = Array.isArray(conns) ? conns : (conns?.data || []);
+            const chosen = list.find(c => c.is_default || c.isDefault) || list.find(c => c.has_api_key) || list[0];
+            if (chosen?.id) cachedConnectionId = chosen.id;
+          } catch (_) { }
+        }
         if (cachedConnectionId) quietReq.connection_id = cachedConnectionId;
 
         const res = await spindle.generate.quiet(quietReq, userId);
