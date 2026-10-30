@@ -269,25 +269,25 @@ async function syncFolderToDatabank(folder, chatId, userId) {
   let targetBank = banks.find(b => String(b.name || "").toLowerCase().trim() === targetBankName.toLowerCase());
 
   if (!targetBank && spindle.databanks.create) {
-    if (isPrivate && charInfo.id) {
+   if (isPrivate && charInfo.id) {
     targetBank = await spindle.databanks.create({
-      name: targetBankName,
-      description: targetBankDesc,
-      scope: "character",
-      scope_id: charInfo.id,
-      enabled: false,
-      userId: uId
+     name: targetBankName,
+     description: targetBankDesc,
+     scope: "character",
+     scope_id: charInfo.id,
+     enabled: false,
+     userId: uId
     }, uId);
-    } else {
+   } else {
     targetBank = await spindle.databanks.create({
-      name: targetBankName,
-      description: targetBankDesc,
-      scope: "global",
-      enabled: false,
-      userId: uId
+     name: targetBankName,
+     description: targetBankDesc,
+     scope: "global",
+     enabled: false,
+     userId: uId
     }, uId);
-    }
-    console.log(`=== ARCHIVE CREATED: ${targetBankName} ===`);
+   }
+   console.log(`=== ARCHIVE CREATED: ${targetBankName} ===`);
   }
 
   const bankId = targetBank?.id || targetBank?.databankId || targetBank?.data?.id;
@@ -399,7 +399,6 @@ async function saveMemoryFolder({ chatId, userId, folderName, folderType, folder
   }
  }
 
- // Sync all folders so legacy drawers get migrated cleanly
  for (const folderItem of Object.values(allFolders)) {
   await syncFolderToDatabank(folderItem, chatId, uId);
  }
@@ -501,7 +500,27 @@ function getChunkEndIdx(c) {
  return c.endMessageIndex ?? c.messageEnd ?? c.endIndex ?? c.metadata?.endIndex;
 }
 
-function inspectSpindle() {
+function summarizeShape(val, depth = 0) {
+ if (val === null || val === undefined) return val;
+ if (typeof val === "string") {
+  return val.length > 100 ? `${val.slice(0, 80)}... [string length: ${val.length}]` : val;
+ }
+ if (typeof val !== "object") return val;
+ if (depth > 2) return Array.isArray(val) ? `[Array(${val.length})]` : "[Object]";
+ if (Array.isArray(val)) {
+  return val.slice(0, 3).map(item => summarizeShape(item, depth + 1));
+ }
+ const out = {};
+ for (const k of Object.keys(val)) {
+  out[k] = summarizeShape(val[k], depth + 1);
+ }
+ return out;
+}
+
+async function inspectSpindle(chatId, userId) {
+ const uId = await ensureUserId(userId);
+ const cId = await getActiveChatId(chatId, uId);
+
  const describeObj = (obj) => {
   if (!obj) return null;
   const info = {};
@@ -516,18 +535,55 @@ function inspectSpindle() {
   return info;
  };
 
- return JSON.stringify({
-  spindleRoot: Object.keys(spindle),
-  databanks: describeObj(spindle.databanks),
-  memories: describeObj(spindle.memories),
-  chats: describeObj(spindle.chats),
-  chat: describeObj(spindle.chat),
-  connections: describeObj(spindle.connections),
-  generate: describeObj(spindle.generate),
+ const report = {
+  media: describeObj(spindle.media),
+  uploads: describeObj(spindle.uploads),
   images: describeObj(spindle.images),
-  variables: describeObj(spindle.variables),
-  ui: describeObj(spindle.ui)
- }, null, 2);
+  imagesListSample: null,
+  linkedChatMediaSamples: []
+ };
+
+ if (spindle.images?.list) {
+  try {
+   const imgs = await spindle.images.list({ userId: uId }, uId);
+   const arr = Array.isArray(imgs) ? imgs : (imgs?.data || imgs?.images || []);
+   report.imagesListSample = { totalCount: arr.length, firstTwo: summarizeShape(arr.slice(0, 2)) };
+  } catch (e) {
+   report.imagesListSample = `Error: ${e.message}`;
+  }
+ }
+
+ if (cId && spindle.memories?.links?.list) {
+  try {
+   const links = await spindle.memories.links.list(cId, uId);
+   for (const l of (links || [])) {
+    const targetCid = l.targetChatId || l.linkedChatId || l.sourceChatId || l.targetId;
+    if (targetCid && targetCid !== cId && spindle.chat?.getMessages) {
+     const rawMsgs = await spindle.chat.getMessages(targetCid, uId);
+     const msgs = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
+     const interesting = [];
+     msgs.forEach((m, idx) => {
+      const keys = Object.keys(m || {});
+      const hasExtra = keys.some(k => !["id", "role", "name", "content", "created_at", "updated_at", "timestamp", "chat_id"].includes(k));
+      const contentNonString = typeof m.content !== "string";
+      const looksLikeImg = JSON.stringify(m).match(/image|media|upload|attach|data:|base64|url|file/i);
+      if ((hasExtra || contentNonString || looksLikeImg || idx < 6) && interesting.length < 8) {
+       interesting.push({ msgIndex: idx, keys, sample: summarizeShape(m) });
+      }
+     });
+     report.linkedChatMediaSamples.push({
+      chatId: targetCid,
+      totalMessages: msgs.length,
+      samples: interesting
+     });
+    }
+   }
+  } catch (e) {
+   report.linkedChatError = e.message;
+  }
+ }
+
+ return JSON.stringify(report, null, 2);
 }
 
 function isUsefulEntity(e) {
@@ -725,11 +781,12 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
  const requestedMode = String(payload.args?.vault_mode || "").trim().toLowerCase();
  const folderName = String(payload.args?.folder_name || "").trim();
 
+ const chatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
+
  if (query === "__inspect__") {
-  return "=== SPINDLE API INSPECTION ===\n" + inspectSpindle();
+  return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId);
  }
 
- const chatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
  const charInfo = await getActiveCharacterInfo(chatId, userId);
  const results = [];
 
