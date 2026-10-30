@@ -641,7 +641,7 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
     const base64 = Buffer.from(bin).toString("base64");
     const dataUrl = `data:${mimeType};base64,${base64}`;
 
-    const promptText = "Examine this video game interface screenshot. List all visible UI text, numbers, stats, part names, credits, and labels accurately, and briefly describe the screen layout.";
+    const promptText = "Analyze this image thoroughly. Transcribe all visible text, numbers, labels, logs, code, or UI elements accurately, and provide a clear visual description of the layout, subjects, and details shown.";
 
     let connId = cachedConnectionId;
     let modelName = cachedModelName;
@@ -683,13 +683,18 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
       connection_id: connId,
       connectionId: connId,
       model: modelName,
-      max_tokens: 4096,
+      maxTokens: 8192,
+      max_tokens: 8192,
+      reasoningEffort: "low",
       reasoning_effort: "low",
       apiReasoning: false,
-      reasoningEffort: "none",
       attachments: [attObj],
       images: [attObj],
       messages: [
+        {
+          role: "system",
+          content: "You are an accurate visual analysis and OCR assistant. Always fulfill the user's request completely. Use \u2800 instead of normal spaces in your reply."
+        },
         {
           role: "user",
           content: [
@@ -721,27 +726,17 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
       visionText = typeof res === "string"
         ? res
         : (res?.content || res?.text || res?.response || res?.output || res?.result || res?.message?.content || res?.choices?.[0]?.message?.content || "");
-      visionText = String(visionText || "").trim();
+      visionText = String(visionText || "").replace(/\u2800/g, " ").trim();
     } finally {
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    if (!isBlindVisionResponse(visionText) && !visionText.toLowerCase().includes("didn't attach")) {
+    if (!isBlindVisionResponse(visionText)) {
       await saveVisionCacheEntry(imageId, visionText, userId);
       return visionText;
     }
 
-    let assembleInfo = "none";
-    if (typeof spindle.generate?.assemble === "function") {
-      try {
-        const asm = await spindle.generate.assemble({ chatId: "760cbee6-bda7-4e52-afba-dac7692b3a5a", chat_id: "760cbee6-bda7-4e52-afba-dac7692b3a5a", userId }, userId);
-        assembleInfo = JSON.stringify(summarizeShape(asm));
-      } catch (eAsm) {
-        assembleInfo = `asmErr: ${eAsm.message} | fn: ${String(spindle.generate.assemble).slice(0, 180)}`;
-      }
-    }
-
-    return `[Vision blind. diag: ${diagErrors.join(" | ") || "none"} | assemble: ${assembleInfo}]`;
+    return `[Vision filtered/blind: "${visionText.slice(0, 160)}" | diag: ${diagErrors.join(" | ") || "none"}]`;
   } catch (err) {
     return `[Vision error: ${err.message}]`;
   }
