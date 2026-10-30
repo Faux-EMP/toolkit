@@ -663,6 +663,21 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
       } catch (_) { }
     }
 
+    const attObj = {
+      id: imageId,
+      image_id: imageId,
+      imageId: imageId,
+      name: imgMeta?.name || "image.png",
+      mime_type: mimeType,
+      mimeType: mimeType,
+      type: "image",
+      width: imgMeta?.width,
+      height: imgMeta?.height,
+      data: base64,
+      base64: base64,
+      url: dataUrl
+    };
+
     const multimodalPayload = {
       userId,
       connection_id: connId,
@@ -670,13 +685,19 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
       model: modelName,
       apiReasoning: false,
       reasoningEffort: "none",
+      attachments: [attObj],
+      images: [attObj],
       messages: [
         {
           role: "user",
           content: [
             { type: "text", text: promptText },
+            { type: "image", mimeType, mime_type: mimeType, data: base64, image: base64, url: dataUrl, image_id: imageId, source: { type: "base64", media_type: mimeType, data: base64 } },
             { type: "image_url", image_url: { url: dataUrl } }
-          ]
+          ],
+          attachments: [attObj],
+          images: [attObj],
+          extra: { attachments: [attObj] }
         }
       ]
     };
@@ -699,20 +720,26 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
         ? res
         : (res?.content || res?.text || res?.response || res?.output || res?.result || res?.message?.content || res?.choices?.[0]?.message?.content || "");
       visionText = String(visionText || "").trim();
-
-      if (!visionText && res && typeof res === "object") {
-        diagErrors.push(`resKeys=${Object.keys(res).join(",")}; rawRes=${JSON.stringify(res).slice(0, 250)}`);
-      }
     } finally {
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    if (!isBlindVisionResponse(visionText)) {
+    if (!isBlindVisionResponse(visionText) && !visionText.toLowerCase().includes("didn't attach")) {
       await saveVisionCacheEntry(imageId, visionText, userId);
       return visionText;
     }
 
-    return `[Vision blind/empty. visionText="${visionText.slice(0, 160)}" | diag: ${diagErrors.join(" | ") || "none"} | rawFn: ${String(spindle.generate?.raw || "").slice(0, 220)}]`;
+    let assembleInfo = "none";
+    if (typeof spindle.generate?.assemble === "function") {
+      try {
+        const asm = await spindle.generate.assemble({ chatId: "760cbee6-bda7-4e52-afba-dac7692b3a5a", chat_id: "760cbee6-bda7-4e52-afba-dac7692b3a5a", userId }, userId);
+        assembleInfo = JSON.stringify(summarizeShape(asm));
+      } catch (eAsm) {
+        assembleInfo = `asmErr: ${eAsm.message} | fn: ${String(spindle.generate.assemble).slice(0, 180)}`;
+      }
+    }
+
+    return `[Vision blind. diag: ${diagErrors.join(" | ") || "none"} | assemble: ${assembleInfo}]`;
   } catch (err) {
     return `[Vision error: ${err.message}]`;
   }
