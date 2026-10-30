@@ -666,16 +666,12 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
     const attObj = {
       id: imageId,
       image_id: imageId,
-      imageId: imageId,
       name: imgMeta?.name || "image.png",
       mime_type: mimeType,
-      mimeType: mimeType,
       type: "image",
       width: imgMeta?.width,
       height: imgMeta?.height,
-      data: base64,
-      base64: base64,
-      url: dataUrl
+      data: base64
     };
 
     const multimodalPayload = {
@@ -683,33 +679,24 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
       connection_id: connId,
       connectionId: connId,
       model: modelName,
-      maxTokens: 8192,
-      max_tokens: 8192,
-      reasoningEffort: "low",
-      reasoning_effort: "low",
+      maxTokens: 4096,
+      max_tokens: 4096,
       apiReasoning: false,
+      reasoningEffort: "none",
       attachments: [attObj],
-      images: [attObj],
       messages: [
-        {
-          role: "system",
-          content: "You are an accurate visual analysis and OCR assistant. Always fulfill the user's request completely. Use \u2800 instead of normal spaces in your reply."
-        },
         {
           role: "user",
           content: [
             { type: "text", text: promptText },
-            { type: "image", mimeType, mime_type: mimeType, data: base64, image: base64, url: dataUrl, image_id: imageId, source: { type: "base64", media_type: mimeType, data: base64 } },
-            { type: "image_url", image_url: { url: dataUrl } }
+            { type: "image", mimeType, mime_type: mimeType, data: base64, url: dataUrl }
           ],
-          attachments: [attObj],
-          images: [attObj],
-          extra: { attachments: [attObj] }
+          attachments: [attObj]
         }
       ]
     };
 
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 3000));
     let visionText = "";
     const diagErrors = [];
 
@@ -728,7 +715,7 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
         : (res?.content || res?.text || res?.response || res?.output || res?.result || res?.message?.content || res?.choices?.[0]?.message?.content || "");
       visionText = String(visionText || "").replace(/\u2800/g, " ").trim();
     } finally {
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 3000));
     }
 
     if (!isBlindVisionResponse(visionText)) {
@@ -736,7 +723,7 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
       return visionText;
     }
 
-    return `[Vision filtered/blind: "${visionText.slice(0, 160)}" | diag: ${diagErrors.join(" | ") || "none"}]`;
+    return `[Vision filtered/blind: "${visionText.slice(0, 160)}" | diag: ${diagErrors.join(" | ") || "none"} | rawFn: ${String(spindle.generate?.raw || "").slice(0, 240)}]`;
   } catch (err) {
     return `[Vision error: ${err.message}]`;
   }
