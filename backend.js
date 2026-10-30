@@ -601,7 +601,9 @@ async function saveVisionCacheEntry(imageId, description, userId) {
   } catch (_) { }
 }
 
-async function analyzeImageById(imageId, userId, contextHint = "") {
+let cachedModelName = null;
+
+async function analyzeImageById(imageId, userId, contextHint = "", searchQuery = "") {
   if (!imageId) return null;
   if (imageVisionMemCache.has(imageId)) {
     const cached = imageVisionMemCache.get(imageId);
@@ -614,7 +616,12 @@ async function analyzeImageById(imageId, userId, contextHint = "") {
     return persisted[imageId];
   }
 
-  if (Date.now() - lastVisionScanAt < 15000) return null;
+  const specificUuidMatch = String(searchQuery || "").match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  if (specificUuidMatch && specificUuidMatch[0].toLowerCase() !== imageId.toLowerCase()) {
+    return null;
+  }
+
+  if (Date.now() - lastVisionScanAt < 45000) return null;
   lastVisionScanAt = Date.now();
 
   if (!spindle.images?.readBinary || !spindle.generate) return null;
@@ -636,28 +643,22 @@ async function analyzeImageById(imageId, userId, contextHint = "") {
 
     const promptText = `Examine this attached screenshot carefully. Transcribe ALL visible text, numbers, stats, part names, credits, and UI labels verbatim, and describe what is shown.${contextHint ? `\nContext caption: "${contextHint.slice(0, 200)}"` : ""}`;
 
-    const attObj = {
-      id: imageId,
-      image_id: imageId,
-      mime_type: mimeType,
-      mimeType: mimeType,
-      type: "image",
-      width: imgMeta?.width,
-      height: imgMeta?.height,
-      data: base64,
-      base64: base64,
-      url: dataUrl
-    };
-
     let connId = cachedConnectionId;
-    if (!connId && spindle.connections?.list) {
+    let modelName = cachedModelName;
+    if ((!connId || !modelName) && spindle.connections?.list) {
       try {
         const conns = await spindle.connections.list(userId);
         const list = Array.isArray(conns) ? conns : (conns?.data || []);
-        const chosen = list.find(c => c.is_default || c.isDefault) || list.find(c => c.has_api_key) || list[0];
+        const chatConns = list.filter(c => !/embed/i.test(c?.name || "") && !/embed/i.test(c?.model || ""));
+        const chosen = chatConns.find(c => c.is_default || c.isDefault) || chatConns.find(c => c.model) || list[0];
         if (chosen?.id) {
           connId = chosen.id;
           cachedConnectionId = connId;
+        }
+        const resolvedModel = chosen?.model || chosen?.model_id || chosen?.modelId || chosen?.default_model;
+        if (resolvedModel) {
+          modelName = resolvedModel;
+          cachedModelName = resolvedModel;
         }
       } catch (_) { }
     }
@@ -666,20 +667,16 @@ async function analyzeImageById(imageId, userId, contextHint = "") {
       userId,
       connection_id: connId,
       connectionId: connId,
+      model: modelName,
       apiReasoning: false,
       reasoningEffort: "none",
-      attachments: [attObj],
-      images: [attObj],
       messages: [
         {
           role: "user",
           content: [
             { type: "text", text: promptText },
             { type: "image_url", image_url: { url: dataUrl } }
-          ],
-          attachments: [attObj],
-          images: [attObj],
-          extra: { attachments: [attObj] }
+          ]
         }
       ]
     };
@@ -697,35 +694,10 @@ async function analyzeImageById(imageId, userId, contextHint = "") {
           diagErrors.push(`raw: ${eRaw.message}`);
         }
       }
-      if (!res && typeof spindle.generate.quiet === "function") {
-        try {
-          res = await spindle.generate.quiet(multimodalPayload, userId);
-        } catch (eQuiet) {
-          diagErrors.push(`quiet(array): ${eQuiet.message}`);
-        }
-      }
-      if (!res && typeof spindle.generate.quiet === "function") {
-        try {
-          res = await spindle.generate.quiet({
-            ...multimodalPayload,
-            messages: [
-              {
-                role: "user",
-                content: promptText,
-                attachments: [attObj],
-                images: [attObj],
-                extra: { attachments: [attObj] }
-              }
-            ]
-          }, userId);
-        } catch (eQuiet2) {
-          diagErrors.push(`quiet(str): ${eQuiet2.message}`);
-        }
-      }
 
       visionText = typeof res === "string"
         ? res
-        : (res?.content || res?.text || res?.message?.content || res?.choices?.[0]?.message?.content || JSON.stringify(res || ""));
+        : (res?.content || res?.text || res?.message?.content || res?.choices?.[0]?.message?.content || "");
       visionText = String(visionText || "").trim();
     } finally {
       await new Promise(r => setTimeout(r, 2000));
@@ -736,9 +708,7 @@ async function analyzeImageById(imageId, userId, contextHint = "") {
       return visionText;
     }
 
-    const quietSrc = String(spindle.generate?.quiet || "").slice(0, 300);
-    const rawSrc = String(spindle.generate?.raw || "").slice(0, 300);
-    return `[Vision blind response. Errors: ${diagErrors.join(" | ") || "none"} | quietSrc: ${quietSrc} | rawSrc: ${rawSrc}]`;
+    return `[Vision unable to read image. Diagnostics: ${diagErrors.join(" | ") || "empty or blind response"}]`;
   } catch (err) {
     return `[Vision error: ${err.message}]`;
   }
@@ -1186,7 +1156,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
                 block += `\n [Cached Vision OCR (${imgId})]:\n${visionCache[imgId]}`;
               } else if (liveScansUsed < 1 && (isImgQuery || query.toLowerCase().includes(imgId.toLowerCase()))) {
                 liveScansUsed++;
-                const liveDesc = await analyzeImageById(imgId, userId, item.rawText);
+                const liveDesc = await analyzeImageById(imgId, userId, item.rawText, query);
                 if (liveDesc) {
                   block += `\n [Live Vision OCR (${imgId})]:\n${liveDesc}`;
                 }
