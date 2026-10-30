@@ -697,8 +697,12 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
 
       visionText = typeof res === "string"
         ? res
-        : (res?.content || res?.text || res?.message?.content || res?.choices?.[0]?.message?.content || "");
+        : (res?.content || res?.text || res?.response || res?.output || res?.result || res?.message?.content || res?.choices?.[0]?.message?.content || "");
       visionText = String(visionText || "").trim();
+
+      if (!visionText && res && typeof res === "object") {
+        diagErrors.push(`resKeys=${Object.keys(res).join(",")}; rawRes=${JSON.stringify(res).slice(0, 250)}`);
+      }
     } finally {
       await new Promise(r => setTimeout(r, 2000));
     }
@@ -708,7 +712,7 @@ async function analyzeImageById(imageId, userId, contextHint = "", searchQuery =
       return visionText;
     }
 
-    return `[Vision unable to read image. Diagnostics: ${diagErrors.join(" | ") || "empty or blind response"}]`;
+    return `[Vision blind/empty. visionText="${visionText.slice(0, 160)}" | diag: ${diagErrors.join(" | ") || "none"} | rawFn: ${String(spindle.generate?.raw || "").slice(0, 220)}]`;
   } catch (err) {
     return `[Vision error: ${err.message}]`;
   }
