@@ -550,6 +550,134 @@ function formatAttachmentTags(m) {
  }).join(" ");
 }
 
+function extractAttachmentIds(m) {
+ const atts = m?.extra?.attachments || m?.attachments || [];
+ if (!Array.isArray(atts)) return [];
+ return atts.map(a => a?.image_id || a?.imageId || a?.id).filter(Boolean);
+}
+
+const imageVisionMemCache = new Map();
+
+async function getVisionCacheMap(userId) {
+ try {
+ const raw = await spindle.variables.global.get("toolkit_image_cache", { userId }, userId);
+ if (raw) {
+ const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+ if (parsed && typeof parsed === "object") {
+ for (const [k, v] of Object.entries(parsed)) imageVisionMemCache.set(k, v);
+ return parsed;
+ }
+ }
+ } catch (_) {}
+ return Object.fromEntries(imageVisionMemCache.entries());
+}
+
+async function saveVisionCacheEntry(imageId, description, userId) {
+ imageVisionMemCache.set(imageId, description);
+ try {
+ const current = await getVisionCacheMap(userId);
+ current[imageId] = description;
+ await spindle.variables.global.set("toolkit_image_cache", JSON.stringify(current), { userId }, userId);
+ } catch (_) {}
+}
+
+async function analyzeImageById(imageId, userId, contextHint = "") {
+ if (!imageId) return null;
+ if (imageVisionMemCache.has(imageId)) return imageVisionMemCache.get(imageId);
+
+ const persisted = await getVisionCacheMap(userId);
+ if (persisted[imageId]) return persisted[imageId];
+
+ if (!spindle.images?.readBinary || !spindle.generate?.quiet) return null;
+
+ try {
+ let mimeType = "image/png";
+ let imgMeta = null;
+ if (spindle.images.get) {
+ try {
+ imgMeta = await spindle.images.get(imageId, userId);
+ if (imgMeta?.mime_type || imgMeta?.mimeType) mimeType = imgMeta.mime_type || imgMeta.mimeType;
+ } catch (_) {}
+ }
+
+ const bin = await spindle.images.readBinary(imageId, userId);
+ if (!bin) return null;
+ const base64 = Buffer.from(bin).toString("base64");
+ const dataUrl = `data:${mimeType};base64,${base64}`;
+
+ const promptText = `Examine this attached screenshot carefully. Transcribe ALL visible text, numbers, stats, part names, credits, and UI labels verbatim, and describe what is shown.${contextHint ? `\nContext caption: "${contextHint.slice(0, 200)}"` : ""}`;
+
+ const attObj = {
+ id: imageId,
+ image_id: imageId,
+ mime_type: mimeType,
+ width: imgMeta?.width,
+ height: imgMeta?.height,
+ data: base64,
+ url: dataUrl
+ };
+
+ await new Promise(r => setTimeout(r, 2000));
+ let visionText = "";
+ try {
+ const reqA = {
+ userId,
+ apiReasoning: false,
+ reasoningEffort: "none",
+ attachments: [attObj],
+ images: [attObj],
+ messages: [
+ {
+ role: "user",
+ content: [
+ { type: "text", text: promptText },
+ { type: "image_url", image_url: { url: dataUrl } }
+ ],
+ attachments: [attObj],
+ extra: { attachments: [attObj] }
+ }
+ ]
+ };
+ if (cachedConnectionId) reqA.connection_id = cachedConnectionId;
+
+ let res = null;
+ try {
+ res = await spindle.generate.quiet(reqA, userId);
+ } catch (_) {
+ const reqB = {
+ ...reqA,
+ messages: [
+ {
+ role: "user",
+ content: promptText,
+ attachments: [attObj],
+  images: [attObj],
+ extra: { attachments: [attObj] }
+ }
+ ]
+ };
+ res = await spindle.generate.quiet(reqB, userId);
+ }
+
+ visionText = typeof res === "string"
+ ? res
+ : (res?.content || res?.text || res?.message?.content || res?.choices?.[0]?.message?.content || "");
+ visionText = String(visionText || "").trim();
+ } finally {
+ await new Promise(r => setTimeout(r, 2000));
+ }
+
+ const looksBlind = !visionText || /\b(cannot see|can't see|no image|not attached|provide the image|unable to view)\b/i.test(visionText);
+ if (!looksBlind) {
+ await saveVisionCacheEntry(imageId, visionText, userId);
+ return visionText;
+ }
+ return `[Vision attempt returned no-image notice: ${visionText.slice(0, 180)}]`;
+ } catch (err) {
+ return `[Vision error: ${err.message}]`;
+ }
+}
+
 function isUsefulEntity(e) {
  if (!e) return false;
  if (Array.isArray(e.facts) && e.facts.length > 0) return true;
@@ -963,16 +1091,37 @@ formatted += `\n ↳ [Paired #${f.msgIdx} | Time: ${f.time} | ${f.role}]\n${f.te
 scoredMsgs.push({
 idx,
 score,
-formatted
+formatted,
+attIds: extractAttachmentIds(m),
+rawText: msgText
 });
 }
 });
 
 if (scoredMsgs.length > 0) {
 scoredMsgs.sort((a, b) => b.score - a.score || a.idx - b.idx);
-const topMsgs = scoredMsgs.slice(0, 6).map(item => item.formatted);
-results.push(`=== INTERLINKED MESSAGES (Chat: ${linkedChatId}) ===\n` + topMsgs.join("\n---\n"));
+const topItems = scoredMsgs.slice(0, 6);
+const visionCache = await getVisionCacheMap(userId);
+let liveScansUsed = 0;
+const topMsgs = [];
+
+for (const item of topItems) {
+let block = item.formatted;
+for (const imgId of (item.attIds || [])) {
+if (visionCache[imgId]) {
+block += `\n 📸 [Cached Vision OCR (${imgId})]:\n${visionCache[imgId]}`;
+} else if (liveScansUsed < 1 && (isImgQuery || query.toLowerCase().includes(imgId.toLowerCase()))) {
+liveScansUsed++;
+const liveDesc = await analyzeImageById(imgId, userId, item.rawText);
+if (liveDesc) {
+block += `\n 📸 [Live Vision OCR (${imgId})]:\n${liveDesc}`;
 }
+}
+}
+topMsgs.push(block);
+}
+
+results.push(`=== INTERLINKED MESSAGES (Chat: ${linkedChatId}) ===\n` + topMsgs.join("\n---\n"));
 }
 
    if (spindle.memories?.chatMemory?.listChunks) {
