@@ -517,10 +517,7 @@ function summarizeShape(val, depth = 0) {
  return out;
 }
 
-async function inspectSpindle(chatId, userId) {
- const uId = await ensureUserId(userId);
- const cId = await getActiveChatId(chatId, uId);
-
+async function inspectSpindle() {
  const describeObj = (obj) => {
  if (!obj) return null;
  const info = {};
@@ -531,50 +528,26 @@ async function inspectSpindle(chatId, userId) {
  return info;
  };
 
- const report = {
- connectionsMethods: describeObj(spindle.connections),
- settingsMethods: describeObj(spindle.settings),
- generateInfo: {
- quiet: String(spindle.generate?.quiet || "").slice(0, 250),
- raw: String(spindle.generate?.raw || "").slice(0, 250),
- assemble: String(spindle.generate?.assemble || "").slice(0, 250)
- },
- readBinaryTest: null,
- connectionsListSample: null
- };
+ return JSON.stringify({
+ databanks: describeObj(spindle.databanks),
+ memories: describeObj(spindle.memories),
+ chats: describeObj(spindle.chats),
+ chat: describeObj(spindle.chat),
+ images: describeObj(spindle.images),
+ variables: describeObj(spindle.variables),
+ ui: describeObj(spindle.ui)
+ }, null, 2);
+}
 
- if (spindle.images?.readBinary) {
- try {
- const bin = await spindle.images.readBinary("46dd411c-dcfa-44bd-bbad-2ce1f3b4a251", uId);
- report.readBinaryTest = {
- type: typeof bin,
- constructorName: bin?.constructor?.name,
- isBuffer: typeof Buffer !== "undefined" ? Buffer.isBuffer(bin) : false,
- byteLength: bin?.byteLength || bin?.length || null,
- keysIfObject: (bin && typeof bin === "object" && !Buffer.isBuffer(bin) && !(bin instanceof Uint8Array)) ? Object.keys(bin) : null
- };
- } catch (e) {
- report.readBinaryTest = `Error: ${e.message}`;
- }
- }
-
- if (spindle.connections?.list) {
- try {
- const conns = await spindle.connections.list(uId);
- const arr = Array.isArray(conns) ? conns : (conns?.data || conns?.connections || []);
- report.connectionsListSample = arr.slice(0, 2).map(c => {
- const copy = { ...c };
- if (copy.apiKey) copy.apiKey = "[REDACTED]";
- if (copy.api_key) copy.api_key = "[REDACTED]";
- if (copy.key) copy.key = "[REDACTED]";
- return summarizeShape(copy);
- });
- } catch (e) {
- report.connectionsListSample = `Error: ${e.message}`;
- }
- }
-
- return JSON.stringify(report, null, 2);
+function formatAttachmentTags(m) {
+ const atts = m?.extra?.attachments || m?.attachments || [];
+ if (!Array.isArray(atts) || atts.length === 0) return "";
+ return atts.map(a => {
+ const imgId = a.image_id || a.imageId || a.id || "unknown";
+ const dims = (a.width && a.height) ? ` (${a.width}x${a.height})` : "";
+ const name = a.name ? ` "${a.name}"` : "";
+ return `[Attached Image: ${imgId}${dims}${name}]`;
+ }).join(" ");
 }
 
 function isUsefulEntity(e) {
@@ -716,30 +689,22 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
   await new Promise(r => setTimeout(r, 2000));
 
   if (spindle.generate?.quiet) {
-   let nativeResult = null;
-   try {
-    let connId = cachedConnectionId;
-    if (!connId && spindle.connections?.list) {
-     const conns = await spindle.connections.list(userId);
-     const list = Array.isArray(conns) ? conns : (conns?.data || []);
-     const chosen = list.find(c => c.is_default || c.isDefault) || list.find(c => c.has_api_key) || list[0];
-     if (chosen?.id) connId = chosen.id;
-    }
-
-    const quietReq = {
-     userId,
-     messages: [
-      {
-       role: "system",
-       content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
-      },
-      {
-       role: "user",
-       content: query
-      }
-     ]
-    };
-    if (connId) quietReq.connection_id = connId;
+let nativeResult = null;
+try {
+const quietReq = {
+userId,
+messages: [
+{
+role: "system",
+content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
+},
+{
+role: "user",
+content: query
+}
+]
+};
+if (cachedConnectionId) quietReq.connection_id = cachedConnectionId;
 
     const res = await spindle.generate.quiet(quietReq, userId);
     if (res?.content) {
@@ -958,29 +923,48 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
    }
 
    if (chatMessages.length > 0) {
-    const scoredMsgs = [];
-    chatMessages.forEach((m, idx) => {
-     const msgTime = formatTime(getMsgTimestamp(m)) || "";
-     const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
-     const combined = `${msgTime} ${msgText}`;
-     const score = countKeywordMatches(combined, keywords);
-     const minRequired = keywords.length <= 4 ? keywords.length : Math.max(2, keywords.length - 1);
-     if (score >= minRequired) {
-      const role = m.role || m.name || (m.is_user ? "User" : "Assistant");
-      scoredMsgs.push({
-       idx,
-       score,
-       formatted: `[Message #${idx} | Time: ${msgTime} | ${role}]\n${msgText}`
-      });
-     }
-    });
+const scoredMsgs = [];
+const isImgQuery = /\b(screenshot|screenshots|image|images|pic|pics|picture|pictures|photo|attachment|attachments|shown|screen|hud)\b/i.test(query);
 
-    if (scoredMsgs.length > 0) {
-     scoredMsgs.sort((a, b) => b.score - a.score || a.idx - b.idx);
-     const topMsgs = scoredMsgs.slice(0, 6).map(item => item.formatted);
-     results.push(`=== INTERLINKED MESSAGES (Chat: ${linkedChatId}) ===\n` + topMsgs.join("\n---\n"));
-    }
-   }
+chatMessages.forEach((m, idx) => {
+const msgTime = formatTime(getMsgTimestamp(m)) || "";
+const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
+const attTag = formatAttachmentTags(m);
+const hasAtt = Boolean(attTag);
+
+const nextMsg = chatMessages[idx + 1];
+const nextText = nextMsg ? (typeof nextMsg.content === "string" ? nextMsg.content : (nextMsg.mes || nextMsg.text || "")) : "";
+
+const combined = `${msgTime} ${attTag} ${msgText} ${hasAtt ? nextText : ""}`;
+let score = countKeywordMatches(combined, keywords);
+if (isImgQuery && hasAtt) score += keywords.length + 2;
+
+const minRequired = hasAtt ? 1 : (keywords.length <= 4 ? Math.max(1, keywords.length - 1) : Math.max(2, keywords.length - 2));
+
+if (score >= minRequired) {
+const role = m.role || m.name || (m.is_user ? "User" : "Assistant");
+let formatted = `[Message #${idx} | Time: ${msgTime} | ${role}]${attTag ? ` ${attTag}` : ""}\n${msgText}`;
+
+if (hasAtt && nextMsg) {
+const nextRole = nextMsg.role || nextMsg.name || (nextMsg.is_user ? "User" : "Assistant");
+const nextTime = formatTime(getMsgTimestamp(nextMsg)) || "";
+formatted += `\n ↳ [Paired Reply #${idx + 1} | Time: ${nextTime} | ${nextRole}]\n${nextText}`;
+}
+
+scoredMsgs.push({
+idx,
+score,
+formatted
+});
+}
+});
+
+if (scoredMsgs.length > 0) {
+scoredMsgs.sort((a, b) => b.score - a.score || a.idx - b.idx);
+const topMsgs = scoredMsgs.slice(0, 6).map(item => item.formatted);
+results.push(`=== INTERLINKED MESSAGES (Chat: ${linkedChatId}) ===\n` + topMsgs.join("\n---\n"));
+}
+}
 
    if (spindle.memories?.chatMemory?.listChunks) {
     const rawChunks = await spindle.memories.chatMemory.listChunks(linkedChatId, userId);
