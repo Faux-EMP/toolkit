@@ -9,6 +9,19 @@ const chatVaultModes = new Map();
 let lastKnownVaultMode = "strict";
 const memoryFoldersCache = new Map();
 
+const KNOWN_CHARACTER_IDS = {
+  "f9c982eb-73ff-4b87-bba8-56a4e57ad3c1": "Assistant",
+  "99869eb2-3ee5-4e4e-a662-881bbf0e907f": "En"
+};
+
+function normalizeCharAlias(name) {
+  const raw = String(name || "Assistant").toLowerCase().trim();
+  if (raw === "en" || raw === "entropy simulation cycle") return "en";
+  if (raw === "jun" || raw === "junior assistant") return "jun";
+  if (raw === "blanc" || raw === "blank slate") return "blanc";
+  return raw;
+}
+
 function resolveUserId(arg) {
   if (typeof arg === "string" && arg.trim()) return arg.trim();
   if (arg && typeof arg === "object") {
@@ -100,6 +113,11 @@ async function getActiveCharacterInfo(chatId, userId, payload = null) {
         const m = msgs[i];
         if (!m || m.is_user || m.role === "user" || m.role === "system") continue;
         const msgCharId = m.extra?.character_id || m.character_id || m.characterId;
+        const msgCharName = m.extra?.character_name || m.extra?.characterName || m.character_name || m.characterName;
+        if (msgCharName) {
+          charName = msgCharName;
+          resolved = true;
+        }
         if (msgCharId) {
           charId = msgCharId;
           break;
@@ -117,8 +135,14 @@ async function getActiveCharacterInfo(chatId, userId, payload = null) {
       }
     }
 
-    // 3. Resolve charId -> character name via spindle.characters
-    if (charId && spindle.characters?.get) {
+    // 3. Resolve charId via known UUID map first
+    if (charId && KNOWN_CHARACTER_IDS[charId]) {
+      charName = KNOWN_CHARACTER_IDS[charId];
+      resolved = true;
+    }
+
+    // 4. Resolve charId -> character name via spindle.characters if available
+    if (charId && !resolved && spindle.characters?.get) {
       const charObj = await spindle.characters.get(charId, userId);
       const foundName = charObj?.name || charObj?.character?.name || charObj?.data?.name;
       if (foundName) {
@@ -138,9 +162,9 @@ async function getActiveCharacterInfo(chatId, userId, payload = null) {
       }
     }
 
-    // 4. Backup: check toolPayload context if available
+    // 5. Backup: check toolPayload context if available
     if (!resolved && payload) {
-      const ctxText = payload?.args?.context || "";
+      const ctxText = payload?.args?.context || payload?.context || "";
       const match = ctxText.match(/Character being portrayed:\s*<([^>\n]+)>/i)
         || ctxText.match(/^Write\s+(.+?)'s\s+next\s+reply/i);
       if (match?.[1]) {
@@ -152,7 +176,7 @@ async function getActiveCharacterInfo(chatId, userId, payload = null) {
     spindle.log?.warn?.(`[Interlinked] getActiveCharacterInfo error: ${err?.message || err}`);
   }
 
-  return { charName, charId };
+  return { name: charName, id: charId, charName, charId };
 }
 
 async function getVaultMode(chatId, userId) {
@@ -210,7 +234,7 @@ async function setVaultMode(chatId, userId, targetMode) {
   return { mode: nextMode, label };
 }
 
-// === ARCHIVES SYSTEM (Shared 'Archives' + Personal 'Assistant's Archive') ===
+// === ARCHIVES SYSTEM (Shared 'Archives' + Personal '<Character>'s Archive') ===
 async function getGlobalFolders(userId) {
   const uId = await ensureUserId(userId);
   if (spindle.variables?.global?.get) {
@@ -230,12 +254,15 @@ async function getGlobalFolders(userId) {
   return Object.fromEntries(memoryFoldersCache.entries());
 }
 
-function canCharacterAccessFolder(folder, activeCharName) {
+function canCharacterAccessFolder(folder, activeCharName, activeCharId = null) {
   if (!folder) return false;
   const scope = String(folder.scope || "shared").toLowerCase();
   if (scope !== "private" && scope !== "character") return true;
-  const owner = String(folder.owner || "Assistant").toLowerCase().trim();
-  const current = String(activeCharName || "Assistant").toLowerCase().trim();
+  if (folder.ownerId && activeCharId) {
+    return folder.ownerId === activeCharId;
+  }
+  const owner = normalizeCharAlias(folder.owner || "Assistant");
+  const current = normalizeCharAlias(activeCharName || "Assistant");
   return owner === current;
 }
 
@@ -263,11 +290,11 @@ function buildFolderMarkdown(folder) {
   return lines.join("\n");
 }
 
-async function syncFolderToDatabank(folder, chatId, userId) {
+async function syncFolderToDatabank(folder, chatId, userId, payload = null) {
   if (!spindle.databanks) return null;
   const uId = await ensureUserId(userId);
   try {
-    const charInfo = await getActiveCharacterInfo(chatId, uId);
+    const charInfo = await getActiveCharacterInfo(chatId, uId, payload);
     let rawBanks = null;
     try {
       rawBanks = await spindle.databanks.list({ userId: uId }, uId);
@@ -301,6 +328,7 @@ async function syncFolderToDatabank(folder, chatId, userId) {
 
     const isPrivate = folder.scope === "private" || folder.scope === "character";
     const ownerName = folder.owner || charInfo.name || "Assistant";
+    const ownerId = folder.ownerId || (normalizeCharAlias(ownerName) === normalizeCharAlias(charInfo.name) ? charInfo.id : null);
     const targetBankName = isPrivate ? `${ownerName}'s Archive` : "Archives";
     const targetBankDesc = isPrivate
       ? `Personal, private memory archive exclusively for ${ownerName}.`
@@ -309,12 +337,12 @@ async function syncFolderToDatabank(folder, chatId, userId) {
     let targetBank = banks.find(b => String(b.name || "").toLowerCase().trim() === targetBankName.toLowerCase());
 
     if (!targetBank && spindle.databanks.create) {
-      if (isPrivate && charInfo.id) {
+      if (isPrivate && ownerId) {
         targetBank = await spindle.databanks.create({
           name: targetBankName,
           description: targetBankDesc,
           scope: "character",
-          scope_id: charInfo.id,
+          scope_id: ownerId,
           enabled: false,
           userId: uId
         }, uId);
@@ -383,12 +411,12 @@ async function syncFolderToDatabank(folder, chatId, userId) {
   return null;
 }
 
-async function saveMemoryFolder({ chatId, userId, folderName, folderType, folderScope, description, facts, replaceFacts }) {
+async function saveMemoryFolder({ chatId, userId, payload, folderName, folderType, folderScope, description, facts, replaceFacts }) {
   const uId = await ensureUserId(userId);
   const cleanName = String(folderName || "").trim();
   if (!cleanName) return null;
 
-  const charInfo = await getActiveCharacterInfo(chatId, uId);
+  const charInfo = await getActiveCharacterInfo(chatId, uId, payload);
   const key = cleanName.toLowerCase();
   const allFolders = await getGlobalFolders(uId);
   const existing = allFolders[key] || {
@@ -396,6 +424,7 @@ async function saveMemoryFolder({ chatId, userId, folderName, folderType, folder
     type: folderType || "topic",
     scope: "shared",
     owner: null,
+    ownerId: null,
     description: "",
     facts: [],
     createdAt: Date.now(),
@@ -408,6 +437,7 @@ async function saveMemoryFolder({ chatId, userId, folderName, folderType, folder
     const s = String(folderScope).toLowerCase().trim();
     existing.scope = (s === "private" || s === "character" || s === "personal") ? "private" : "shared";
     existing.owner = existing.scope === "private" ? charInfo.name : null;
+    existing.ownerId = existing.scope === "private" ? charInfo.id : null;
   }
 
   const incomingFacts = Array.isArray(facts)
@@ -440,7 +470,7 @@ async function saveMemoryFolder({ chatId, userId, folderName, folderType, folder
   }
 
   for (const folderItem of Object.values(allFolders)) {
-    await syncFolderToDatabank(folderItem, chatId, uId);
+    await syncFolderToDatabank(folderItem, chatId, uId, payload);
   }
 
   console.log(`=== ARCHIVE FOLDER SAVED: ${cleanName} [${existing.scope}] (${existing.facts.length} total facts) ===`);
@@ -988,13 +1018,14 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId, payload);
   }
 
-  const activeChar = await getActiveCharacterInfo(chatId, userId, payload);
+  const charInfo = await getActiveCharacterInfo(chatId, userId, payload);
   const results = [];
 
   if (folderName) {
     const savedFolder = await saveMemoryFolder({
       chatId,
       userId,
+      payload,
       folderName,
       folderType: payload.args?.folder_type,
       folderScope: payload.args?.folder_scope,
@@ -1028,7 +1059,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
   }
 
   const allFolders = await getGlobalFolders(userId);
-  const accessibleFolders = Object.values(allFolders).filter(f => canCharacterAccessFolder(f, charInfo.name));
+  const accessibleFolders = Object.values(allFolders).filter(f => canCharacterAccessFolder(f, charInfo.name, charInfo.id));
 
   if (query === "__list_folders__") {
     if (accessibleFolders.length === 0) return "No Archive folders have been created yet.";
