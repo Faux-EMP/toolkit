@@ -86,33 +86,73 @@ async function getActiveChatId(chatId, userId) {
   return cachedChatId;
 }
 
-async function getActiveCharacterInfo(chatId, userId) {
-  const uId = await ensureUserId(userId);
-  const cId = await getActiveChatId(chatId, uId);
+async function getActiveCharacterInfo(chatId, userId, payload = null) {
   let charName = "Assistant";
   let charId = null;
+  let resolved = false;
 
-  if (spindle.chats?.getActive) {
-    try {
-      const active = await spindle.chats.getActive(uId);
-      if (active) {
-        charName = active.characterName || active.character_name || active.character?.name || charName;
-        charId = active.character_id || active.characterId || active.character?.id || null;
+  try {
+    // 1. Check the latest non-user message first (includes the in-flight empty stub for the current turn!)
+    if (chatId && spindle.chat?.getMessages) {
+      const rawMsgs = await spindle.chat.getMessages(chatId, userId);
+      const msgs = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (!m || m.is_user || m.role === "user" || m.role === "system") continue;
+        const msgCharId = m.extra?.character_id || m.character_id || m.characterId;
+        if (msgCharId) {
+          charId = msgCharId;
+          break;
+        }
       }
-    } catch (e) { }
+    }
+
+    // 2. Fall back to the chat's primary character_id if no assistant message stub had one
+    if (!charId) {
+      const chatObj = chatId ? await spindle.chats?.get?.(chatId, userId) : null;
+      const active = await spindle.chats?.getActive?.(userId);
+      const src = chatObj || active;
+      if (src) {
+        charId = src.character_id || src.characterId || src.character?.id || null;
+      }
+    }
+
+    // 3. Resolve charId -> character name via spindle.characters
+    if (charId && spindle.characters?.get) {
+      const charObj = await spindle.characters.get(charId, userId);
+      const foundName = charObj?.name || charObj?.character?.name || charObj?.data?.name;
+      if (foundName) {
+        charName = foundName;
+        resolved = true;
+      }
+    }
+
+    if (charId && !resolved && spindle.characters?.list) {
+      const listRaw = await spindle.characters.list(userId);
+      const list = Array.isArray(listRaw) ? listRaw : (listRaw?.characters || listRaw?.data || []);
+      const match = list.find(c => (c?.id || c?.character_id) === charId);
+      const foundName = match?.name || match?.character?.name || match?.data?.name;
+      if (foundName) {
+        charName = foundName;
+        resolved = true;
+      }
+    }
+
+    // 4. Backup: check toolPayload context if available
+    if (!resolved && payload) {
+      const ctxText = payload?.args?.context || "";
+      const match = ctxText.match(/Character being portrayed:\s*<([^>\n]+)>/i)
+        || ctxText.match(/^Write\s+(.+?)'s\s+next\s+reply/i);
+      if (match?.[1]) {
+        charName = match[1].trim();
+        resolved = true;
+      }
+    }
+  } catch (err) {
+    spindle.log?.warn?.(`[Interlinked] getActiveCharacterInfo error: ${err?.message || err}`);
   }
 
-  if (!charId && cId && spindle.chats?.get) {
-    try {
-      const chatObj = await spindle.chats.get(cId, uId);
-      if (chatObj) {
-        charName = chatObj.characterName || chatObj.character_name || chatObj.character?.name || charName;
-        charId = chatObj.character_id || chatObj.characterId || chatObj.character?.id || null;
-      }
-    } catch (e) { }
-  }
-
-  return { name: String(charName || "Assistant").trim(), id: charId };
+  return { charName, charId };
 }
 
 async function getVaultMode(chatId, userId) {
@@ -948,7 +988,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId, payload);
   }
 
-  const charInfo = await getActiveCharacterInfo(chatId, userId);
+  const activeChar = await getActiveCharacterInfo(chatId, userId, payload);
   const results = [];
 
   if (folderName) {
