@@ -517,7 +517,7 @@ function summarizeShape(val, depth = 0) {
   return out;
 }
 
-async function inspectSpindle() {
+async function inspectSpindle(chatId, userId, payload) {
   const describeObj = (obj) => {
     if (!obj) return null;
     const info = {};
@@ -528,14 +528,28 @@ async function inspectSpindle() {
     return info;
   };
 
+  const allApis = {};
+  for (const k of Object.keys(spindle)) {
+    allApis[k] = (spindle[k] && typeof spindle[k] === "object") ? describeObj(spindle[k]) : typeof spindle[k];
+  }
+
+  let activeChat = null;
+  let chatObj = null;
+  let recentMsgs = null;
+  try { activeChat = await spindle.chats?.getActive?.(userId); } catch (e) { activeChat = e.message; }
+  try { chatObj = chatId ? await spindle.chats?.get?.(chatId, userId) : null; } catch (e) { chatObj = e.message; }
+  try {
+    const rawMsgs = chatId ? await spindle.chat?.getMessages?.(chatId, userId) : null;
+    const arr = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
+    recentMsgs = arr.slice(-4);
+  } catch (e) { recentMsgs = e.message; }
+
   return JSON.stringify({
-    databanks: describeObj(spindle.databanks),
-    memories: describeObj(spindle.memories),
-    chats: describeObj(spindle.chats),
-    chat: describeObj(spindle.chat),
-    images: describeObj(spindle.images),
-    variables: describeObj(spindle.variables),
-    ui: describeObj(spindle.ui)
+    spindleKeys: allApis,
+    toolPayload: summarizeShape(payload),
+    activeChat: summarizeShape(activeChat),
+    chatObj: summarizeShape(chatObj),
+    recentMessages: summarizeShape(recentMsgs)
   }, null, 2);
 }
 
@@ -931,7 +945,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
   const chatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
 
   if (query === "__inspect__") {
-    return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId);
+    return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId, payload);
   }
 
   const charInfo = await getActiveCharacterInfo(chatId, userId);
