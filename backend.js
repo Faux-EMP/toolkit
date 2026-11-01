@@ -235,7 +235,186 @@ async function setVaultMode(chatId, userId, targetMode) {
 }
 
 // === ARCHIVES SYSTEM (Shared 'Archives' + Personal '<Character>'s Archive') ===
-async function getGlobalFolders(userId) {
+function decodeDocBytes(raw) {
+  if (!raw) return null;
+  if (typeof raw === "string") return raw;
+  try {
+    if (raw instanceof Uint8Array || (typeof Buffer !== "undefined" && Buffer.isBuffer(raw))) {
+      return new TextDecoder().decode(raw);
+    }
+    if (Array.isArray(raw)) {
+      return new TextDecoder().decode(new Uint8Array(raw));
+    }
+    if (typeof raw === "object" && Array.isArray(raw.data)) {
+      return new TextDecoder().decode(new Uint8Array(raw.data));
+    }
+    if (typeof raw === "object" && raw.buffer instanceof ArrayBuffer) {
+      return new TextDecoder().decode(new Uint8Array(raw.buffer));
+    }
+  } catch (e) { }
+  return null;
+}
+
+async function readDatabankDocText(docApi, bankId, docItem, uId) {
+  const direct = decodeDocBytes(docItem?.content ?? docItem?.text ?? docItem?.body ?? docItem?.markdown ?? docItem?.data);
+  if (direct) return direct;
+
+  const docId = docItem?.id || docItem?.documentId || docItem?.doc_id;
+  if (!docId) return null;
+
+  for (const fnName of ["get", "read", "getContent", "readBinary"]) {
+    if (typeof docApi?.[fnName] !== "function") continue;
+    let res = null;
+    try {
+      res = await docApi[fnName](docId, uId);
+    } catch (e1) {
+      try {
+        res = await docApi[fnName](bankId, docId, uId);
+      } catch (e2) {
+        try {
+          res = await docApi[fnName](docId, { userId: uId }, uId);
+        } catch (e3) { }
+      }
+    }
+    if (res) {
+      const unwrapped = res?.document || res?.data || res;
+      const decoded = decodeDocBytes(unwrapped?.content ?? unwrapped?.text ?? unwrapped?.body ?? unwrapped?.markdown ?? unwrapped?.data ?? res);
+      if (decoded) return decoded;
+    }
+  }
+  return null;
+}
+
+function cleanFactLine(line) {
+  return String(line || "")
+    .trim()
+    .replace(/^(?:\d+[\.\)]\s*)+/, "")
+    .replace(/^[-*•]\s+/, "")
+    .trim();
+}
+
+function parseFolderMarkdown(mdText, fallbackName = "") {
+  if (!mdText || typeof mdText !== "string") return null;
+  const lines = mdText.split(/\r?\n/);
+  let name = fallbackName;
+  let type = null;
+  let description = null;
+  const facts = [];
+  let inFacts = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    if (!inFacts) {
+      const h1 = line.match(/^#\s+(.+)$/);
+      if (h1) {
+        name = h1[1].trim();
+        continue;
+      }
+      const catMatch = line.match(/^\*\*Category:\*\*\s*(.+)$/i);
+      if (catMatch) {
+        type = catMatch[1].trim();
+        continue;
+      }
+      const descMatch = line.match(/^\*\*Description:\*\*\s*(.+)$/i);
+      if (descMatch) {
+        description = descMatch[1].trim();
+        continue;
+      }
+      if (/^##\s*Compiled\s+Facts/i.test(line)) {
+        inFacts = true;
+        continue;
+      }
+      if (/^\*\*(Access|Last\s+Updated):\*\*/i.test(line)) {
+        continue;
+      }
+    } else {
+      if (/^#+\s/.test(line)) continue;
+      const cleaned = cleanFactLine(line);
+      if (cleaned) facts.push(cleaned);
+    }
+  }
+
+  return { name, type, description, facts, foundFactsHeader: inFacts };
+}
+
+async function pullEditsFromDatabanks(allFolders, uId) {
+  if (!spindle.databanks?.list || !spindle.databanks?.documents?.list) return allFolders;
+  let changed = false;
+
+  try {
+    let rawBanks = null;
+    try {
+      rawBanks = await spindle.databanks.list({ userId: uId }, uId);
+    } catch (e1) {
+      rawBanks = await spindle.databanks.list(uId);
+    }
+    const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
+    const archiveBanks = banks.filter(b => {
+      const n = String(b?.name || "").toLowerCase().trim();
+      return n === "archives" || n.endsWith("'s archive");
+    });
+
+    const docApi = spindle.databanks.documents;
+
+    for (const bank of archiveBanks) {
+      const bankId = bank?.id || bank?.databankId;
+      if (!bankId) continue;
+
+      let rawDocs = null;
+      try {
+        rawDocs = await docApi.list(bankId, { limit: 100, userId: uId }, uId);
+      } catch (e2) {
+        rawDocs = await docApi.list(bankId, uId);
+      }
+      const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.data || rawDocs?.documents || []);
+
+      for (const d of docs) {
+        const rawTitle = String(d.filename || d.name || d.title || "").trim();
+        if (!rawTitle) continue;
+
+        const folderNameFromDoc = rawTitle.replace(/^\[.*?\]\s*/, "").replace(/\.md$/i, "").trim();
+        const key = folderNameFromDoc.toLowerCase();
+        if (!key) continue;
+
+        const mdText = await readDatabankDocText(docApi, bankId, d, uId);
+        if (!mdText) continue;
+
+        const parsed = parseFolderMarkdown(mdText, folderNameFromDoc);
+        if (!parsed || (!parsed.foundFactsHeader && parsed.facts.length === 0)) continue;
+
+        const existing = allFolders[key];
+        if (existing) {
+          const oldFactsJson = JSON.stringify((existing.facts || []).map(cleanFactLine));
+          const newFactsJson = JSON.stringify(parsed.facts);
+          const descChanged = parsed.description && parsed.description !== existing.description;
+          const typeChanged = parsed.type && parsed.type !== existing.type;
+
+          if (oldFactsJson !== newFactsJson || descChanged || typeChanged) {
+            existing.facts = parsed.facts;
+            if (parsed.description) existing.description = parsed.description;
+            if (parsed.type) existing.type = parsed.type;
+            memoryFoldersCache.set(key, existing);
+            allFolders[key] = existing;
+            changed = true;
+            console.log(`=== PULLED MANUAL DATABANK EDITS FOR: ${existing.name} (${parsed.facts.length} facts) ===`);
+          }
+        }
+      }
+    }
+
+    if (changed && spindle.variables?.global?.set) {
+      await spindle.variables.global.set("toolkit_folders", JSON.stringify(allFolders), uId);
+    }
+  } catch (err) {
+    console.warn("Databank pull sync warning:", err.message);
+  }
+
+  return allFolders;
+}
+
+async function getGlobalFolders(userId, syncFromBanks = true) {
   const uId = await ensureUserId(userId);
   if (spindle.variables?.global?.get) {
     try {
@@ -245,13 +424,21 @@ async function getGlobalFolders(userId) {
         : raw;
       const parsed = typeof unwrapped === "string" ? JSON.parse(unwrapped) : unwrapped;
       if (parsed && typeof parsed === "object") {
+        memoryFoldersCache.clear();
         for (const [k, v] of Object.entries(parsed)) {
+          if (v && Array.isArray(v.facts)) {
+            v.facts = v.facts.map(cleanFactLine).filter(Boolean);
+          }
           memoryFoldersCache.set(k, v);
         }
       }
     } catch (e) { }
   }
-  return Object.fromEntries(memoryFoldersCache.entries());
+  const allFolders = Object.fromEntries(memoryFoldersCache.entries());
+  if (syncFromBanks) {
+    return await pullEditsFromDatabanks(allFolders, uId);
+  }
+  return allFolders;
 }
 
 function canCharacterAccessFolder(folder, activeCharName, activeCharId = null) {
@@ -285,7 +472,8 @@ function buildFolderMarkdown(folder) {
     "## Compiled Facts"
   ];
   (folder.facts || []).forEach((f, idx) => {
-    lines.push(`${idx + 1}. ${f}`);
+    const clean = cleanFactLine(f);
+    if (clean) lines.push(`${idx + 1}. ${clean}`);
   });
   return lines.join("\n");
 }
@@ -303,28 +491,6 @@ async function syncFolderToDatabank(folder, chatId, userId, payload = null) {
     }
 
     const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
-
-    // Clean up old test databanks automatically
-    const legacyNames = [
-      "memory folders",
-      "toolkit folders",
-      "tech & projects",
-      "people & characters",
-      "oct 23, 2026, 11:24:43 pm's archive",
-      "new databank"
-    ];
-    if (spindle.databanks.delete) {
-      for (const b of banks) {
-        const bName = String(b.name || "").toLowerCase().trim();
-        if (legacyNames.includes(bName)) {
-          const bId = b.id || b.databankId;
-          if (bId) {
-            try { await spindle.databanks.delete(bId, uId); } catch (delErr) { }
-            console.log(`=== DELETED LEGACY DATABANK: ${b.name} ===`);
-          }
-        }
-      }
-    }
 
     const isPrivate = folder.scope === "private" || folder.scope === "character";
     const ownerName = folder.owner || charInfo.name || "Assistant";
@@ -418,7 +584,7 @@ async function saveMemoryFolder({ chatId, userId, payload, folderName, folderTyp
 
   const charInfo = await getActiveCharacterInfo(chatId, uId, payload);
   const key = cleanName.toLowerCase();
-  const allFolders = await getGlobalFolders(uId);
+  const allFolders = await getGlobalFolders(uId, true);
   const existing = allFolders[key] || {
     name: cleanName,
     type: folderType || "topic",
@@ -448,9 +614,9 @@ async function saveMemoryFolder({ chatId, userId, payload, folderName, folderTyp
     existing.facts = [];
   }
 
-  const seen = new Set((existing.facts || []).map(f => String(f).toLowerCase().trim()));
+  const seen = new Set((existing.facts || []).map(f => cleanFactLine(f).toLowerCase()));
   for (const f of incomingFacts) {
-    const trimmed = String(f).trim();
+    const trimmed = cleanFactLine(f);
     if (trimmed && !seen.has(trimmed.toLowerCase())) {
       existing.facts.push(trimmed);
       seen.add(trimmed.toLowerCase());
@@ -469,9 +635,8 @@ async function saveMemoryFolder({ chatId, userId, payload, folderName, folderTyp
     }
   }
 
-  for (const folderItem of Object.values(allFolders)) {
-    await syncFolderToDatabank(folderItem, chatId, uId, payload);
-  }
+  // Only sync the specific folder that was updated so we never overwrite manual edits on other files!
+  await syncFolderToDatabank(existing, chatId, uId, payload);
 
   console.log(`=== ARCHIVE FOLDER SAVED: ${cleanName} [${existing.scope}] (${existing.facts.length} total facts) ===`);
   return existing;
