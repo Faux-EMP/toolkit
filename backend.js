@@ -1189,6 +1189,8 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       const quietReq = {
        userId,
        connection_id: connId,
+       connectionId: connId,
+       model: "gemini-3.1-flash-lite",
        messages: [
         {
          role: "system",
