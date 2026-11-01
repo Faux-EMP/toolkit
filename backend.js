@@ -1190,7 +1190,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
        userId,
        connection_id: connId,
        connectionId: connId,
-       model: "gemini-3.1-flash-lite",
+       model: "gemini-3-flash-preview",
        messages: [
         {
          role: "system",
