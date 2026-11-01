@@ -1199,64 +1199,67 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
   console.log("=== WEB SEARCH TRIGGERED ===", query, "userId:", userId);
 
   let lastSearchErr = null;
-
-  // 2000ms buffer BEFORE calling Main Proxy so active stream slot settles
-  await new Promise(r => setTimeout(r, 2000));
-
   if (spindle.generate?.quiet) {
    let nativeResult = null;
-   try {
-    let targetConnId = cachedConnectionId;
+   let targetConnId = payload?.connectionId || payload?.connection_id || cachedConnectionId;
 
-    if (spindle.connections?.list) {
-     try {
-      const connsRaw = await spindle.connections.list(userId);
-      const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
-      // Filter out GLM, Kimi, and local 127.0.0.1 / 192.168 test proxies
-      const mainCandidates = list.filter(c => {
-       const blob = JSON.stringify(c || {}).toLowerCase();
-       return !blob.includes("glm") && !blob.includes("kimi") && !blob.includes("moonshot") && !blob.includes("127.0.0.1") && !blob.includes("192.168.");
-      });
-      const cachedIsSafe = targetConnId && mainCandidates.some(c => (c.id || c.connectionId) === targetConnId);
-      if (!cachedIsSafe) {
-       const chosen = mainCandidates.find(c => c.is_default || c.isDefault) || mainCandidates[0];
-       if (chosen) targetConnId = chosen.id || chosen.connectionId || chosen.connection_id;
-      }
-     } catch (_) { }
-    }
+   if (spindle.connections?.list) {
+    try {
+     const connsRaw = await spindle.connections.list(userId);
+     const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
+     // Filter out GLM, Kimi, and local 127.0.0.1 / 192.168 test proxies
+     const mainCandidates = list.filter(c => {
+      const blob = JSON.stringify(c || {}).toLowerCase();
+      return !blob.includes("glm") && !blob.includes("kimi") && !blob.includes("moonshot") && !blob.includes("127.0.0.1") && !blob.includes("192.168.");
+     });
+     const cachedIsSafe = targetConnId && mainCandidates.some(c => (c.id || c.connectionId || c.connection_id) === targetConnId);
+     if (!cachedIsSafe) {
+      targetConnId = null; // Active connection is Castle / GLM / Kimi -> skip quiet search and go straight to SearXNG!
+     }
+    } catch (_) { }
+   }
 
-    const quietReq = {
-     userId,
-     ...(targetConnId ? { connection_id: targetConnId, connectionId: targetConnId } : {}),
-     messages: [
-      {
-       role: "system",
-       content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
-      },
-      {
-       role: "user",
-       content: query
-      }
-     ]
-    };
-
-    console.log(`=== WEB SEARCH ROUTING VIA MAIN PROXY (${targetConnId || "default"}) ===`);
-    const res = await spindle.generate.quiet(quietReq, userId);
-    const text = typeof res === "string"
-     ? res
-     : (res?.content || res?.text || res?.response || res?.message?.content || "");
-
-    if (text && String(text).trim().length > 0) {
-     nativeResult = `=== WEB SEARCH RESULTS (Native) ===\n${String(text).trim()}`;
-    } else {
-     lastSearchErr = "Main proxy returned empty search content.";
-    }
-   } catch (err) {
-    lastSearchErr = err.message;
-    console.warn("Quiet native search failed, falling back to SearXNG:", err.message);
-   } finally {
-    // 2000ms buffer AFTER calling Main Proxy so upstream connection closes cleanly
+   if (targetConnId) {
+    // 2000ms buffer BEFORE calling Main Proxy so active stream slot settles
     await new Promise(r => setTimeout(r, 2000));
+    try {
+     const quietReq = {
+      userId,
+      connection_id: targetConnId,
+      connectionId: targetConnId,
+      messages: [
+       {
+        role: "system",
+        content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
+       },
+       {
+        role: "user",
+        content: query
+       }
+      ]
+     };
+
+     console.log(`=== WEB SEARCH ROUTING VIA MAIN PROXY (${targetConnId}) ===`);
+     const res = await spindle.generate.quiet(quietReq, userId);
+     const text = typeof res === "string"
+      ? res
+      : (res?.content || res?.text || res?.response || res?.message?.content || "");
+
+     if (text && String(text).trim().length > 0) {
+      nativeResult = `=== WEB SEARCH RESULTS (Native) ===\n${String(text).trim()}`;
+     } else {
+      lastSearchErr = "Main proxy returned empty search content.";
+     }
+    } catch (err) {
+     lastSearchErr = err.message;
+     console.warn("Quiet native search failed, falling back to SearXNG:", err.message);
+    } finally {
+     // 2000ms buffer AFTER calling Main Proxy so upstream connection closes cleanly
+     await new Promise(r => setTimeout(r, 2000));
+    }
+   } else {
+    lastSearchErr = "Skipped native search (active connection is non-Main proxy).";
+    console.log("=== WEB SEARCH: Non-Main proxy active, jumping straight to SearXNG ===");
    }
 
    if (nativeResult) return nativeResult;
