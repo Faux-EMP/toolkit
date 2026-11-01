@@ -1173,39 +1173,22 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     const connsRaw = await spindle.connections.list(userId);
     const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
 
-    // Filter out GLM, Kimi, and embedding profiles
-    const validConns = list.filter(c => {
-     const blob = `${c?.name || ""} ${c?.label || ""} ${c?.model || ""} ${c?.provider || ""}`.toLowerCase();
-     return !blob.includes("glm") && !blob.includes("kimi") && !blob.includes("moonshot") && !blob.includes("zhipu") && !blob.includes("embed");
-    });
+    // Find the dedicated "Search" profile by checking all string fields on the object
+    const searchConn = list.find(c => JSON.stringify(c || {}).toLowerCase().includes("search"));
 
-    // Prioritize dedicated "Search" connection first
-    const searchConn = validConns.find(c => String(c?.name || c?.label || "").toLowerCase().includes("search"));
-    const orderedConns = searchConn
-     ? [searchConn, ...validConns.filter(c => c !== searchConn)]
-     : validConns;
+    // If "Search" exists, LOCK exclusively onto it so we never touch other proxies!
+    const targetConns = searchConn ? [searchConn] : list;
 
-    for (const conn of orderedConns) {
+    for (const conn of targetConns) {
      const connId = conn?.id || conn?.connectionId || conn?.connection_id;
-     const connName = conn?.name || conn?.label || connId;
-     const connModel = conn?.model || conn?.model_id || conn?.modelId || conn?.default_model;
-     const isDedicatedSearch = String(connName).toLowerCase().includes("search");
+     const connName = conn?.name || conn?.label || conn?.title || connId;
      if (!connId) continue;
 
-     if (!isDedicatedSearch) {
-      await new Promise(r => setTimeout(r, 2000));
-     }
-
      try {
-      console.log(`=== WEB SEARCH ROUTING VIA: ${connName} (${connModel || "default"}) ===`);
+      console.log(`=== WEB SEARCH LOCKED ONTO: ${connName} ===`);
       const quietReq = {
        userId,
        connection_id: connId,
-       connectionId: connId,
-       model: connModel,
-       apiReasoning: false,
-       reasoningEffort: "none",
-       tools: [{ google_search: {} }],
        messages: [
         {
          role: "system",
@@ -1221,7 +1204,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       const res = await spindle.generate.quiet(quietReq, userId);
       const text = typeof res === "string"
        ? res
-       : (res?.content || res?.text || res?.response || res?.message?.content || res?.choices?.[0]?.message?.content || "");
+       : (res?.content || res?.text || res?.response || res?.message?.content || "");
 
       if (text && String(text).trim().length > 0) {
        console.log(`=== WEB SEARCH SUCCESS VIA ${connName} (${String(text).length} chars) ===`);
@@ -1229,14 +1212,10 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       }
      } catch (innerErr) {
       console.warn(`Quiet search on [${connName}] failed:`, innerErr.message);
-     } finally {
-      if (!isDedicatedSearch) {
-       await new Promise(r => setTimeout(r, 2000));
-      }
      }
     }
    } catch (err) {
-    console.warn("Quiet native search loop error:", err.message);
+    console.warn("Quiet native search error:", err.message);
    }
   }
 
@@ -1249,7 +1228,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
    }
   }
 
-  return "Web search unavailable: no active search connection responded.";
+  return "Web search unavailable: Search connection did not return results.";
  }
 
  if (payload.toolName !== "recall_memory") return;
