@@ -1168,29 +1168,29 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
   const query = String(payload.args?.query || "").trim();
   console.log("=== WEB SEARCH TRIGGERED ===", query, "userId:", userId);
 
+  let lastSearchErr = null;
+
   if (spindle.generate?.quiet && spindle.connections?.list) {
    try {
     const connsRaw = await spindle.connections.list(userId);
     const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
 
-    // Find the dedicated "Search" profile by checking all string fields on the object
     const searchConn = list.find(c => JSON.stringify(c || {}).toLowerCase().includes("search"));
-
-    // If "Search" exists, LOCK exclusively onto it so we never touch other proxies!
     const targetConns = searchConn ? [searchConn] : list;
 
     for (const conn of targetConns) {
      const connId = conn?.id || conn?.connectionId || conn?.connection_id;
      const connName = conn?.name || conn?.label || conn?.title || connId;
+     const connModel = conn?.model || conn?.model_id || conn?.modelId || conn?.default_model || conn?.defaultModel || conn?.selected_model || conn?.config?.model || conn?.settings?.model;
      if (!connId) continue;
 
      try {
-      console.log(`=== WEB SEARCH LOCKED ONTO: ${connName} ===`);
+      console.log(`=== WEB SEARCH LOCKED ONTO: ${connName} (Model: ${connModel || "profile-default"}) ===`);
       const quietReq = {
        userId,
        connection_id: connId,
        connectionId: connId,
-       model: "gemini-3-flash-preview",
+       ...(connModel ? { model: connModel } : {}),
        messages: [
         {
          role: "system",
@@ -1210,13 +1210,16 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
       if (text && String(text).trim().length > 0) {
        console.log(`=== WEB SEARCH SUCCESS VIA ${connName} (${String(text).length} chars) ===`);
-       return `=== WEB SEARCH RESULTS (${connName}) ===\n${String(text).trim()}`;
+       return `=== WEB SEARCH RESULTS (${connName} - ${connModel || "default"}) ===\n${String(text).trim()}`;
       }
+      lastSearchErr = `Empty response from [${connName}] (model: ${connModel || "none"}, keys: ${Object.keys(conn || {}).join(",")})`;
      } catch (innerErr) {
+      lastSearchErr = `[${connName} | model: ${connModel || "none"}] ${innerErr.message}`;
       console.warn(`Quiet search on [${connName}] failed:`, innerErr.message);
      }
     }
    } catch (err) {
+    lastSearchErr = err.message;
     console.warn("Quiet native search error:", err.message);
    }
   }
@@ -1226,11 +1229,11 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     const search = await spindle.webSearch.query({ query, count: 5, userId }, userId);
     return `=== WEB SEARCH RESULTS (SearXNG) ===\n${search.context || JSON.stringify(search, null, 2)}`;
    } catch (err) {
-    return `Web search error: ${err.message}`;
+    return `Web search failed. Native search error: ${lastSearchErr || "unknown"} | SearXNG error: ${err.message}`;
    }
   }
 
-  return "Web search unavailable: Search connection did not return results.";
+  return `Web search unavailable: ${lastSearchErr || "Search connection did not return results."}`;
  }
 
  if (payload.toolName !== "recall_memory") return;
