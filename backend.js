@@ -1111,6 +1111,37 @@ spindle.registerTool({
   inline_available: true
 });
 
+function stripChunkOverlaps(rawText) {
+ const lines = String(rawText || "").split(/\r?\n/);
+ const clean = [];
+ let i = 0;
+ while (i < lines.length) {
+  let  duplicateLen = 0;
+  const maxWin = Math.min(45, clean.length, lines.length - i);
+  for (let w = maxWin; w >= 2; w--) {
+   let match = true;
+   for (let k = 0; k < w; k++) {
+    if (clean[clean.length - w + k].trim() !== lines[i + k].trim()) {
+     match = false;
+     break;
+    }
+   }
+   // Require at least one non-trivial line so closing braces alone don't false-trigger
+   if (match && lines.slice(i, i + w).some(l => l.trim().length > 12)) {
+    duplicateLen = w;
+    break;
+   }
+  }
+  if (duplicateLen > 0) {
+   i += duplicateLen;
+  } else {
+   clean.push(lines[i]);
+   i++;
+  }
+ }
+ return clean.join("\n");
+}
+
 async function getRawDatabankFiles(uId, activeCharName) {
  if (!spindle.databanks?.list || !spindle.databanks?.documents?.list) return [];
  const rawFiles = [];
@@ -1144,14 +1175,13 @@ async function getRawDatabankFiles(uId, activeCharName) {
     if (!rawTitle) continue;
     const mdText = await readDatabankDocText(docApi, bankId, d, uId);
     if (!mdText) continue;
-    // If it does NOT have '## Compiled Facts', treat it as a untouched Raw File!
     if (/^##\s*Compiled\s+Facts/im.test(mdText)) continue;
     const cleanName = rawTitle.replace(/^\[.*?\]\s*/, "").replace(/\.md$/i, "").trim();
     rawFiles.push({
      filename: rawTitle,
      cleanName,
      bankName: bank.name,
-     content: mdText
+     content: stripChunkOverlaps(mdText)
     });
    }
   }
@@ -1170,58 +1200,66 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
   let lastSearchErr = null;
 
-  if (spindle.generate?.quiet && spindle.connections?.list) {
+  // 2000ms buffer BEFORE calling Main Proxy so active stream slot settles
+  await new Promise(r => setTimeout(r, 2000));
+
+  if (spindle.generate?.quiet) {
+   let nativeResult = null;
    try {
-    const connsRaw = await spindle.connections.list(userId);
-    const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
+    let targetConnId = cachedConnectionId;
 
-    const searchConn = list.find(c => JSON.stringify(c || {}).toLowerCase().includes("search"));
-    const targetConns = searchConn ? [searchConn] : list;
-
-    for (const conn of targetConns) {
-     const connId = conn?.id || conn?.connectionId || conn?.connection_id;
-     const connName = conn?.name || conn?.label || conn?.title || connId;
-     const connModel = conn?.model || conn?.model_id || conn?.modelId || conn?.default_model || conn?.defaultModel || conn?.selected_model || conn?.config?.model || conn?.settings?.model;
-     if (!connId) continue;
-
+    if (spindle.connections?.list) {
      try {
-      console.log(`=== WEB SEARCH LOCKED ONTO: ${connName} (Model: ${connModel || "profile-default"}) ===`);
-      const quietReq = {
-       userId,
-       connection_id: connId,
-       connectionId: connId,
-       ...(connModel ? { model: connModel } : {}),
-       messages: [
-        {
-         role: "system",
-         content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
-        },
-        {
-         role: "user",
-         content: query
-        }
-       ]
-      };
-
-      const res = await spindle.generate.quiet(quietReq, userId);
-      const text = typeof res === "string"
-       ? res
-       : (res?.content || res?.text || res?.response || res?.message?.content || "");
-
-      if (text && String(text).trim().length > 0) {
-       console.log(`=== WEB SEARCH SUCCESS VIA ${connName} (${String(text).length} chars) ===`);
-       return `=== WEB SEARCH RESULTS (${connName} - ${connModel || "default"}) ===\n${String(text).trim()}`;
+      const connsRaw = await spindle.connections.list(userId);
+      const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
+      // Filter out GLM, Kimi, and local 127.0.0.1 / 192.168 test proxies
+      const mainCandidates = list.filter(c => {
+       const blob = JSON.stringify(c || {}).toLowerCase();
+       return !blob.includes("glm") && !blob.includes("kimi") && !blob.includes("moonshot") && !blob.includes("127.0.0.1") && !blob.includes("192.168.");
+      });
+      const cachedIsSafe = targetConnId && mainCandidates.some(c => (c.id || c.connectionId) === targetConnId);
+      if (!cachedIsSafe) {
+       const chosen = mainCandidates.find(c => c.is_default || c.isDefault) || mainCandidates[0];
+       if (chosen) targetConnId = chosen.id || chosen.connectionId || chosen.connection_id;
       }
-      lastSearchErr = `Empty response from [${connName}] (model: ${connModel || "none"}, keys: ${Object.keys(conn || {}).join(",")})`;
-     } catch (innerErr) {
-      lastSearchErr = `[${connName} | model: ${connModel || "none"}] ${innerErr.message}`;
-      console.warn(`Quiet search on [${connName}] failed:`, innerErr.message);
-     }
+     } catch (_) { }
+    }
+
+    const quietReq = {
+     userId,
+     ...(targetConnId ? { connection_id: targetConnId, connectionId: targetConnId } : {}),
+     messages: [
+      {
+       role: "system",
+       content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
+      },
+      {
+       role: "user",
+       content: query
+      }
+     ]
+    };
+
+    console.log(`=== WEB SEARCH ROUTING VIA MAIN PROXY (${targetConnId || "default"}) ===`);
+    const res = await spindle.generate.quiet(quietReq, userId);
+    const text = typeof res === "string"
+     ? res
+     : (res?.content || res?.text || res?.response || res?.message?.content || "");
+
+    if (text && String(text).trim().length > 0) {
+     nativeResult = `=== WEB SEARCH RESULTS (Native) ===\n${String(text).trim()}`;
+    } else {
+     lastSearchErr = "Main proxy returned empty search content.";
     }
    } catch (err) {
     lastSearchErr = err.message;
-    console.warn("Quiet native search error:", err.message);
+    console.warn("Quiet native search failed, falling back to SearXNG:", err.message);
+   } finally {
+    // 2000ms buffer AFTER calling Main Proxy so upstream connection closes cleanly
+    await new Promise(r => setTimeout(r, 2000));
    }
+
+   if (nativeResult) return nativeResult;
   }
 
   if (spindle.webSearch?.query) {
@@ -1229,11 +1267,11 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     const search = await spindle.webSearch.query({ query, count: 5, userId }, userId);
     return `=== WEB SEARCH RESULTS (SearXNG) ===\n${search.context || JSON.stringify(search, null, 2)}`;
    } catch (err) {
-    return `Web search failed. Native search error: ${lastSearchErr || "unknown"} | SearXNG error: ${err.message}`;
+    return `Web search failed. Native error: ${lastSearchErr || "unknown"} | SearXNG error: ${err.message}`;
    }
   }
 
-  return `Web search unavailable: ${lastSearchErr || "Search connection did not return results."}`;
+  return `Web search unavailable: ${lastSearchErr || "no search provider responded."}`;
  }
 
  if (payload.toolName !== "recall_memory") return;
