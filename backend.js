@@ -1111,185 +1111,299 @@ spindle.registerTool({
   inline_available: true
 });
 
-spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
-  const userId = await ensureUserId(resolveUserId(eventUserId) || resolveUserId(payload));
-
-  if (payload.toolName === "web_search") {
-    const query = String(payload.args?.query || "").trim();
-    console.log("=== WEB SEARCH TRIGGERED ===", query, "userId:", userId);
-
-    await new Promise(r => setTimeout(r, 2000));
-
-    if (spindle.generate?.quiet) {
-      let nativeResult = null;
-      try {
-        const quietReq = {
-          userId,
-          messages: [
-            {
-              role: "system",
-              content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
-            },
-            {
-              role: "user",
-              content: query
-            }
-          ]
-        };
-        if (!cachedConnectionId && spindle.connections?.list) {
-          try {
-            const conns = await spindle.connections.list(userId);
-            const list = Array.isArray(conns) ? conns : (conns?.data || []);
-            const chosen = list.find(c => c.is_default || c.isDefault) || list.find(c => c.has_api_key) || list[0];
-            if (chosen?.id) cachedConnectionId = chosen.id;
-          } catch (_) { }
-        }
-        if (cachedConnectionId) quietReq.connection_id = cachedConnectionId;
-
-        const res = await spindle.generate.quiet(quietReq, userId);
-        if (res?.content) {
-          nativeResult = `=== WEB SEARCH RESULTS (Native) ===\n${res.content}`;
-        }
-      } catch (err) {
-        console.warn("Quiet native search failed, falling back to SearXNG:", err.message);
-      } finally {
-        await new Promise(r => setTimeout(r, 2000));
-      }
-
-      if (nativeResult) return nativeResult;
-    }
-
-    if (spindle.webSearch?.query) {
-      try {
-        const search = await spindle.webSearch.query({ query, count: 5, userId }, userId);
-        return `=== WEB SEARCH RESULTS (SearXNG) ===\n${search.context || JSON.stringify(search, null, 2)}`;
-      } catch (err) {
-        return `Web search error: ${err.message}`;
-      }
-    }
-
-    return "Web search unavailable: ensure 'generation' or 'web_search' permission is granted to the extension.";
-  }
-
-  if (payload.toolName !== "recall_memory") return;
-
-  const query = String(payload.args?.query || "").trim();
-  const requestedMode = String(payload.args?.vault_mode || "").trim().toLowerCase();
-  const folderName = String(payload.args?.folder_name || "").trim();
-
-  const chatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
-
-  if (query === "__inspect__") {
-    return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId, payload);
-  }
-
-  const charInfo = await getActiveCharacterInfo(chatId, userId, payload);
-  const results = [];
-
-  if (folderName) {
-    const savedFolder = await saveMemoryFolder({
-      chatId,
-      userId,
-      payload,
-      folderName,
-      folderType: payload.args?.folder_type,
-      folderScope: payload.args?.folder_scope,
-      description: payload.args?.folder_description,
-      facts: payload.args?.folder_facts,
-      replaceFacts: Boolean(payload.args?.folder_replace)
-    });
-    if (savedFolder) {
-      results.push(`=== ARCHIVE UPDATED: ${savedFolder.name} (${savedFolder.scope === "private" ? `${savedFolder.owner}'s Archive` : "Archives"}) ===\n` + JSON.stringify({
-        name: savedFolder.name,
-        type: savedFolder.type,
-        scope: savedFolder.scope,
-        owner: savedFolder.owner,
-        description: savedFolder.description,
-        totalFacts: savedFolder.facts.length,
-        facts: savedFolder.facts,
-        lastUpdated: formatTime(savedFolder.updatedAt)
-      }, null, 2));
-    }
-  }
-
-  if (requestedMode === "all" || query.includes("__all_vaults__")) {
-    const res = await setVaultMode(chatId, userId, "all");
-    if (query === "__all_vaults__" && !folderName) return res.label;
-  } else if (requestedMode === "strict" || query.includes("__strict_vaults__")) {
-    const res = await setVaultMode(chatId, userId, "strict");
-    if (query === "__strict_vaults__" && !folderName) return res.label;
-  } else if (requestedMode === "toggle" || query.includes("__toggle_vaults__")) {
-    const res = await setVaultMode(chatId, userId, "toggle");
-    if (query === "__toggle_vaults__" && !folderName) return res.label;
-  }
-
-  const allFolders = await getGlobalFolders(userId);
-  const accessibleFolders = Object.values(allFolders).filter(f => canCharacterAccessFolder(f, charInfo.name, charInfo.id));
-
-  if (query === "__list_folders__") {
-    if (accessibleFolders.length === 0) return "No Archive folders have been created yet.";
-    return "=== ACCESSIBLE ARCHIVE FOLDERS ===\n" + JSON.stringify(accessibleFolders.map(f => ({
-      name: f.name,
-      type: f.type,
-      archive: f.scope === "private" ? `${f.owner}'s Archive` : "Archives",
-      description: f.description,
-      factCount: f.facts?.length || 0,
-      facts: f.facts,
-      lastUpdated: formatTime(f.updatedAt)
-    })), null, 2);
-  }
-
-  const keywords = extractKeywords(query);
-  const vaultMode = await getVaultMode(chatId, userId);
-  console.log("=== MEMORY RECALL TRIGGERED ===", query, "vaultMode:", vaultMode, "char:", charInfo.name);
-
+async function getRawDatabankFiles(uId, activeCharName) {
+ if (!spindle.databanks?.list || !spindle.databanks?.documents?.list) return [];
+ const rawFiles = [];
+ try {
+  let rawBanks = null;
   try {
-    const attachedLinks = (chatId && spindle.memories?.links?.list)
-      ? await spindle.memories.links.list(chatId, userId)
-      : [];
-    const activeLinks = (attachedLinks || []).filter(l => l.enabled !== false);
+   rawBanks = await spindle.databanks.list({ userId: uId }, uId);
+  } catch (e1) {
+   rawBanks = await spindle.databanks.list(uId);
+  }
+  const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
+  const charArchiveName = `${String(activeCharName || "Assistant").toLowerCase().trim()}'s archive`;
+  const targetBanks = banks.filter(b => {
+   const n = String(b?.name || "").toLowerCase().trim();
+   return n === "archives" || n === charArchiveName;
+  });
 
-    const allVaults = spindle.memories?.vaults?.list
-      ? await spindle.memories.vaults.list(userId)
-      : [];
-    const vaultIdMap = new Map((allVaults || []).map(v => [v.id, v]));
+  const docApi = spindle.databanks.documents;
+  for (const bank of targetBanks) {
+   const bankId = bank?.id || bank?.databankId;
+   if (!bankId) continue;
+   let rawDocs = null;
+   try {
+    rawDocs = await docApi.list(bankId, { limit: 100, userId: uId }, uId);
+   } catch (e2) {
+    rawDocs = await docApi.list(bankId, uId);
+   }
+   const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.data || rawDocs?.documents || []);
+   for (const d of docs) {
+    const rawTitle = String(d.filename || d.name || d.title || "").trim();
+    if (!rawTitle) continue;
+    const mdText = await readDatabankDocText(docApi, bankId, d, uId);
+    if (!mdText) continue;
+    // If it does NOT have '## Compiled Facts', treat it as a untouched Raw File!
+    if (/^##\s*Compiled\s+Facts/im.test(mdText)) continue;
+    const cleanName = rawTitle.replace(/^\[.*?\]\s*/, "").replace(/\.md$/i, "").trim();
+    rawFiles.push({
+     filename: rawTitle,
+     cleanName,
+     bankName: bank.name,
+     content: mdText
+    });
+   }
+  }
+ } catch (err) {
+  console.warn("Raw databank file scan warning:", err.message);
+ }
+ return rawFiles;
+}
 
-    const attachedVaults = [];
-    const interlinkedChatIds = new Set();
+spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
+ const userId = await ensureUserId(resolveUserId(eventUserId) || resolveUserId(payload));
 
-    for (const link of activeLinks) {
-      const vId = link.vaultId || link.targetVaultId || link.sourceVaultId || (vaultIdMap.has(link.targetId) ? link.targetId : null);
-      if (vId && vaultIdMap.has(vId)) {
-        attachedVaults.push(vaultIdMap.get(vId));
-        continue;
+ if (payload.toolName === "web_search") {
+  const query = String(payload.args?.query || "").trim();
+  console.log("=== WEB SEARCH TRIGGERED ===", query, "userId:", userId);
+
+  if (spindle.generate?.quiet && spindle.connections?.list) {
+   try {
+    const connsRaw = await spindle.connections.list(userId);
+    const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
+
+    // Filter out GLM, Kimi, and embedding profiles
+    const validConns = list.filter(c => {
+     const blob = `${c?.name || ""} ${c?.label || ""} ${c?.model || ""} ${c?.provider || ""}`.toLowerCase();
+     return !blob.includes("glm") && !blob.includes("kimi") && !blob.includes("moonshot") && !blob.includes("zhipu") && !blob.includes("embed");
+    });
+
+    // Prioritize dedicated "Search" connection first
+    const searchConn = validConns.find(c => String(c?.name || c?.label || "").toLowerCase().includes("search"));
+    const orderedConns = searchConn
+     ? [searchConn, ...validConns.filter(c => c !== searchConn)]
+     : validConns;
+
+    for (const conn of orderedConns) {
+     const connId = conn?.id || conn?.connectionId || conn?.connection_id;
+     const connName = conn?.name || conn?.label || connId;
+     const connModel = conn?.model || conn?.model_id || conn?.modelId || conn?.default_model;
+     const isDedicatedSearch = String(connName).toLowerCase().includes("search");
+     if (!connId) continue;
+
+     if (!isDedicatedSearch) {
+      await new Promise(r => setTimeout(r, 2000));
+     }
+
+     try {
+      console.log(`=== WEB SEARCH ROUTING VIA: ${connName} (${connModel || "default"}) ===`);
+      const quietReq = {
+       userId,
+       connection_id: connId,
+       connectionId: connId,
+       model: connModel,
+       apiReasoning: false,
+       reasoningEffort: "none",
+       tools: [{ google_search: {} }],
+       messages: [
+        {
+         role: "system",
+         content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
+        },
+        {
+         role: "user",
+         content: query
+        }
+       ]
+      };
+
+      const res = await spindle.generate.quiet(quietReq, userId);
+      const text = typeof res === "string"
+       ? res
+       : (res?.content || res?.text || res?.response || res?.message?.content || res?.choices?.[0]?.message?.content || "");
+
+      if (text && String(text).trim().length > 0) {
+       console.log(`=== WEB SEARCH SUCCESS VIA ${connName} (${String(text).length} chars) ===`);
+       return `=== WEB SEARCH RESULTS (${connName}) ===\n${String(text).trim()}`;
       }
-      const cId = link.targetChatId || link.linkedChatId || link.sourceChatId || link.targetId || (link.chatId !== chatId ? link.chatId : null);
-      if (cId && cId !== chatId && !vaultIdMap.has(cId)) {
-        interlinkedChatIds.add(cId);
+     } catch (innerErr) {
+      console.warn(`Quiet search on [${connName}] failed:`, innerErr.message);
+     } finally {
+      if (!isDedicatedSearch) {
+       await new Promise(r => setTimeout(r, 2000));
       }
+     }
     }
+   } catch (err) {
+    console.warn("Quiet native search loop error:", err.message);
+   }
+  }
 
-    const vaultsToSearch = vaultMode === "all" ? (allVaults || []) : attachedVaults;
-    const vaultNames = vaultsToSearch.map(v => v.name).join(", ") || "None";
-    results.unshift(`[Vault Recall Mode: ${vaultMode.toUpperCase()} | Active Character: ${charInfo.name} | Accessible Archives: ${accessibleFolders.length} | Searching Vaults (${vaultsToSearch.length}): ${vaultNames} | Active Interlinks: ${interlinkedChatIds.size}]`);
+  if (spindle.webSearch?.query) {
+   try {
+    const search = await spindle.webSearch.query({ query, count: 5, userId }, userId);
+    return `=== WEB SEARCH RESULTS (SearXNG) ===\n${search.context || JSON.stringify(search, null, 2)}`;
+   } catch (err) {
+    return `Web search error: ${err.message}`;
+   }
+  }
 
-    if (accessibleFolders.length > 0 && keywords.length > 0) {
-      const matchedFolders = accessibleFolders.filter(f =>
-        matchesKeywords(f.name, keywords) ||
-        matchesKeywords(f.description, keywords) ||
-        matchesKeywords(JSON.stringify(f.facts || []), keywords)
-      );
-      if (matchedFolders.length > 0) {
-        results.push("=== ARCHIVES (Compiled Dossiers) ===\n" + JSON.stringify(matchedFolders.map(f => ({
-          name: f.name,
-          type: f.type,
-          archive: f.scope === "private" ? `${f.owner}'s Archive` : "Archives",
-          description: f.description,
-          facts: f.facts,
-          lastUpdated: formatTime(f.updatedAt)
-        })), null, 2));
+  return "Web search unavailable: no active search connection responded.";
+ }
+
+ if (payload.toolName !== "recall_memory") return;
+
+ const query = String(payload.args?.query || "").trim();
+ const requestedMode = String(payload.args?.vault_mode || "").trim().toLowerCase();
+ const folderName = String(payload.args?.folder_name || "").trim();
+
+ const chatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
+
+ if (query === "__inspect__") {
+  return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId, payload);
+ }
+
+ const charInfo = await getActiveCharacterInfo(chatId, userId, payload);
+ const results = [];
+
+ if (folderName) {
+  const savedFolder = await saveMemoryFolder({
+   chatId,
+   userId,
+   payload,
+   folderName,
+   folderType: payload.args?.folder_type,
+   folderScope: payload.args?.folder_scope,
+   description: payload.args?.folder_description,
+   facts: payload.args?.folder_facts,
+   replaceFacts: Boolean(payload.args?.folder_replace)
+  });
+  if (savedFolder) {
+   results.push(`=== ARCHIVE UPDATED: ${savedFolder.name} (${savedFolder.scope === "private" ? `${savedFolder.owner}'s Archive` : "Archives"}) ===\n` + JSON.stringify({
+    name: savedFolder.name,
+    type: savedFolder.type,
+    scope: savedFolder.scope,
+    owner: savedFolder.owner,
+    description: savedFolder.description,
+    totalFacts: savedFolder.facts.length,
+    facts: savedFolder.facts,
+    lastUpdated: formatTime(savedFolder.updatedAt)
+   }, null, 2));
+  }
+ }
+
+ if (requestedMode === "all" || query.includes("__all_vaults__")) {
+  const res = await setVaultMode(chatId, userId, "all");
+  if (query === "__all_vaults__" && !folderName) return res.label;
+ } else if (requestedMode === "strict" || query.includes("__strict_vaults__")) {
+  const res = await setVaultMode(chatId, userId, "strict");
+  if (query === "__strict_vaults__" && !folderName) return res.label;
+ } else if (requestedMode === "toggle" || query.includes("__toggle_vaults__")) {
+  const res = await setVaultMode(chatId, userId, "toggle");
+  if (query === "__toggle_vaults__" && !folderName) return res.label;
+ }
+
+ const allFolders = await getGlobalFolders(userId);
+ const accessibleFolders = Object.values(allFolders).filter(f => canCharacterAccessFolder(f, charInfo.name, charInfo.id));
+ const rawFiles = await getRawDatabankFiles(userId, charInfo.name);
+
+ if (query === "__list_folders__") {
+  if (accessibleFolders.length === 0 && rawFiles.length === 0) return "No Archive folders have been created yet.";
+  return "=== ACCESSIBLE ARCHIVE FOLDERS ===\n" + JSON.stringify({
+   compiledDossiers: accessibleFolders.map(f => ({
+    name: f.name,
+    type: f.type,
+    archive: f.scope === "private" ? `${f.owner}'s Archive` : "Archives",
+    description: f.description,
+    factCount: f.facts?.length || 0,
+    facts: f.facts,
+    lastUpdated: formatTime(f.updatedAt)
+   })),
+   rawFiles: rawFiles.map(rf => ({
+    filename: rf.filename,
+    archive: rf.bankName,
+    lines: rf.content.split(/\r?\n/).length
+   }))
+  }, null, 2);
+ }
+
+ const keywords = extractKeywords(query);
+ const vaultMode = await getVaultMode(chatId, userId);
+ console.log("=== MEMORY RECALL TRIGGERED ===", query, "vaultMode:", vaultMode, "char:", charInfo.name);
+
+ try {
+  const attachedLinks = (chatId && spindle.memories?.links?.list)
+   ? await spindle.memories.links.list(chatId, userId)
+   : [];
+  const activeLinks = (attachedLinks || []).filter(l => l.enabled !== false);
+
+  const allVaults = spindle.memories?.vaults?.list
+   ? await spindle.memories.vaults.list(userId)
+   : [];
+  const vaultIdMap = new Map((allVaults || []).map(v => [v.id, v]));
+
+  const attachedVaults = [];
+  const interlinkedChatIds = new Set();
+
+  for (const link of activeLinks) {
+   const vId = link.vaultId || link.targetVaultId || link.sourceVaultId || (vaultIdMap.has(link.targetId) ? link.targetId : null);
+   if (vId && vaultIdMap.has(vId)) {
+    attachedVaults.push(vaultIdMap.get(vId));
+    continue;
+   }
+   const cId = link.targetChatId || link.linkedChatId || link.sourceChatId || link.targetId || (link.chatId !== chatId ? link.chatId : null);
+   if (cId && cId !== chatId && !vaultIdMap.has(cId)) {
+    interlinkedChatIds.add(cId);
+   }
+  }
+
+  const vaultsToSearch = vaultMode === "all" ? (allVaults || []) : attachedVaults;
+  const vaultNames = vaultsToSearch.map(v => v.name).join(", ") || "None";
+  results.unshift(`[Vault Recall Mode: ${vaultMode.toUpperCase()} | Active Character: ${charInfo.name} | Accessible Archives: ${accessibleFolders.length} (+${rawFiles.length} Raw) | Searching Vaults (${vaultsToSearch.length}): ${vaultNames} | Active Interlinks: ${interlinkedChatIds.size}]`);
+
+  if (accessibleFolders.length > 0 && keywords.length > 0) {
+   const matchedFolders = accessibleFolders.filter(f =>
+    matchesKeywords(f.name, keywords) ||
+    matchesKeywords(f.description, keywords) ||
+    matchesKeywords(JSON.stringify(f.facts || []), keywords)
+   );
+   if (matchedFolders.length > 0) {
+    results.push("=== ARCHIVES (Compiled Dossiers) ===\n" + JSON.stringify(matchedFolders.map(f => ({
+     name: f.name,
+     type: f.type,
+     archive: f.scope === "private" ? `${f.owner}'s Archive` : "Archives",
+     description: f.description,
+     facts: f.facts,
+     lastUpdated: formatTime(f.updatedAt)
+    })), null, 2));
+   }
+  }
+
+  // Check Raw Files (like backend.js.md) only when explicitly named in query!
+  if (rawFiles.length > 0 && keywords.length > 0) {
+   const qLower = query.toLowerCase();
+   for (const rf of rawFiles) {
+    const fullLower = rf.cleanName.toLowerCase();
+    const stemLower = fullLower.replace(/\.[a-z0-9]+$/i, "");
+    if (qLower.includes(fullLower) || (stemLower.length >= 4 && qLower.includes(stemLower))) {
+     const lines = rf.content.split(/\r?\n/);
+     const extraKws = keywords.filter(k => k !== fullLower && k !== stemLower && !rf.filename.toLowerCase().includes(k));
+     const matchedLineNums = [];
+     const numberedLines = lines.map((lineText, idx) => {
+      const lineNum = idx + 1;
+      if (extraKws.length > 0 && extraKws.some(k => lineText.toLowerCase().includes(k))) {
+       matchedLineNums.push(lineNum);
       }
+      return `${lineNum}: ${lineText}`;
+     });
+     const matchHeader = matchedLineNums.length > 0
+      ? `[Keyword matches (${extraKws.join(", ")}) on lines: ${matchedLineNums.slice(0, 80).join(", ")}]\n`
+      : "";
+     results.push(`=== RAW ARCHIVE FILE: ${rf.filename} (${lines.length} lines) ===\n${matchHeader}${numberedLines.join("\n")}`);
     }
+   }
+  }
 
     if (chatId && spindle.memories?.entities?.list && keywords.length > 0) {
       const localEntities = await spindle.memories.entities.list(chatId, {
