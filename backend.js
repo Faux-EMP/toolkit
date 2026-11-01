@@ -1461,6 +1461,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
    const vaultTime = formatTime(fullVault?.created_at || fullVault?.createdAt || v.created_at || v.createdAt);
    const vaultLabel = vaultTime ? `${v.name} | Snapshot: ${vaultTime}` : v.name;
    const vaultNameMatched = matchesKeywords(v.name, keywords);
+   const isExplicitlyAttached = attachedVaults.some(av => av.id === v.id);
 
    const matchedEntities = (fullVault?.entities || [])
     .filter(isUsefulEntity)
@@ -1483,26 +1484,27 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
      .map(item => item.c);
 
     if ((scoredChunks.length > 0 || vaultNameMatched || matchedEntities.length > 0) && chunks.length > 0) {
-     const chronological = [...chunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
-     const recentTail = chronological.slice(-2).map(c => ({ ...c, _latestTag: "LATEST IN VAULT" }));
-     const seenIds = new Set();
-     const combinedChunks = [];
+     const combinedChunks = [...scoredChunks];
 
-     for (const item of [...scoredChunks, ...recentTail]) {
-      const key = item.id || item.chunk_id || item._arrIdx;
-      if (seenIds.has(key)) {
-       if (item._latestTag) {
-        const existing = combinedChunks.find(x => (x.id || x.chunk_id || x._arrIdx) === key);
-        if (existing) existing._latestTag = item._latestTag;
+     // Only append the latest 2 chunks if this Vault's name was searched OR it is explicitly attached to this chat!
+     if (vaultNameMatched || isExplicitlyAttached) {
+      const chronological = [...chunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
+      const recentTail = chronological.slice(-2).map(c => ({ ...c, _latestTag: "LATEST IN VAULT" }));
+      for (const tailItem of recentTail) {
+       const tKey = tailItem.id || tailItem.chunk_id || tailItem._arrIdx;
+       const existing = combinedChunks.find(x => (x.id || x.chunk_id || x._arrIdx) === tKey);
+       if (existing) {
+        existing._latestTag = "LATEST IN VAULT";
+       } else {
+        combinedChunks.push(tailItem);
        }
-       continue;
       }
-      seenIds.add(key);
-      combinedChunks.push(item);
      }
 
-     const formattedChunks = formatAndSortChunks(combinedChunks);
-     results.push(`=== VAULT CHAT CHUNKS (${vaultLabel} | Total Chunks: ${chunks.length}) ===\n` + formattedChunks.join("\n---\n"));
+     if (combinedChunks.length > 0) {
+      const formattedChunks = formatAndSortChunks(combinedChunks);
+      results.push(`=== VAULT CHAT CHUNKS (${vaultLabel} | Total Chunks: ${chunks.length}) ===\n` + formattedChunks.join("\n---\n"));
+     }
     }
    }
   }
@@ -1602,19 +1604,19 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
      }
     });
 
-    scoredMsgs.sort((a, b) => b.score - a.score || a.idx - b.idx);
-    const topItems = scoredMsgs.slice(0, 5);
+    // ONLY include results (and the last 2 messages) if this Interlinked chat actually matched the search!
+    if (scoredMsgs.length > 0) {
+     scoredMsgs.sort((a, b) => b.score - a.score || a.idx - b.idx);
+     const topItems = scoredMsgs.slice(0, 5);
 
-    // Always append the last 4 messages of an active Interlinked chat so we know where it left off!
-    const tailStart = Math.max(0, chatMessages.length - 4);
-    for (let tIdx = tailStart; tIdx < chatMessages.length; tIdx++) {
-     if (!topItems.some(item => item.idx === tIdx)) {
-      topItems.push(buildMsgEntry(chatMessages[tIdx], tIdx, 0, true));
+     const tailStart = Math.max(0, chatMessages.length - 2);
+     for (let tIdx = tailStart; tIdx < chatMessages.length; tIdx++) {
+      if (!topItems.some(item => item.idx === tIdx)) {
+       topItems.push(buildMsgEntry(chatMessages[tIdx], tIdx, 0, true));
+      }
      }
-    }
-    topItems.sort((a, b) => a.idx - b.idx);
+     topItems.sort((a, b) => a.idx - b.idx);
 
-    if (topItems.length > 0) {
      const visionCache = await getVisionCacheMap(userId);
      let liveScansUsed = 0;
      const topMsgs = [];
@@ -1660,16 +1662,13 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
      .slice(0, 5)
      .map(item => item.c);
 
-    if (enrichedChunks.length > 0) {
+    // ONLY append the final 1 chunk if this Interlinked chat already had matching chunks!
+    if (matchedChunks.length > 0 && enrichedChunks.length > 0) {
      const chronological = [...enrichedChunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
-     for (const tailChunk of chronological.slice(-2)) {
-      if (!matchedChunks.some(mc => (mc.id || mc._arrIdx) === (tailChunk.id || tailChunk._arrIdx))) {
-       matchedChunks.push({ ...tailChunk, _latestTag: "LATEST CHUNK" });
-      }
+     const tailChunk = chronological[chronological.length - 1];
+     if (tailChunk && !matchedChunks.some(mc => (mc.id || mc._arrIdx) === (tailChunk.id || tailChunk._arrIdx))) {
+      matchedChunks.push({ ...tailChunk, _latestTag: "LATEST CHUNK" });
      }
-    }
-
-    if (matchedChunks.length > 0) {
      const formattedChunks = formatAndSortChunks(matchedChunks);
      results.push(`=== INTERLINKED CHAT CHUNKS (Chat: ${linkedChatId}) ===\n` + formattedChunks.join("\n---\n"));
     }
