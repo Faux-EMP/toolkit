@@ -1166,7 +1166,9 @@ async function getRawDatabankFiles(uId, activeCharName) {
   const charArchiveName = `${String(activeCharName || "Assistant").toLowerCase().trim()}'s archive`;
   const targetBanks = banks.filter(b => {
    const n = String(b?.name || "").toLowerCase().trim();
-   return n === "archives" || n === charArchiveName;
+   if (!n) return false;
+   if (n.endsWith("'s archive")) return n === charArchiveName;
+   return true; // Scan 'Archives' AND any dedicated project databank!
   });
 
   const docApi = spindle.databanks.documents;
