@@ -1353,14 +1353,42 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
   if (payload.toolName === "web_search") {
     const query = String(payload.args?.query || "").trim();
-    console.log("=== WEB SEARCH TRIGGERED ===", query);
     let lastSearchErr = null;
 
     if (spindle.generate?.quiet) {
+      let targetConnId = payload?.connectionId || payload?.connection_id || cachedConnectionId;
+
+      if (!targetConnId && spindle.connections?.list) {
+        try {
+          let activeModel = "";
+          const activeChatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
+          if (activeChatId && spindle.chat?.getMessages) {
+            const msgsRaw = await spindle.chat.getMessages(activeChatId, { limit: 10, userId }, userId);
+            const msgs = Array.isArray(msgsRaw) ? msgsRaw : (msgsRaw?.messages || msgsRaw?.data || []);
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              const m = msgs[i]?.extra?.generationMetrics?.model || msgs[i]?.extra?.model || "";
+              if (m) {
+                activeModel = String(m).toLowerCase();
+                break;
+              }
+            }
+          }
+          const connsRaw = await spindle.connections.list(userId);
+          const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
+          const chatConns = list.filter(c => !/embed/i.test(c?.model || ""));
+          const matched = (activeModel && chatConns.find(c => String(c.model || "").toLowerCase() === activeModel)) || chatConns[0];
+          if (matched) {
+            targetConnId = matched.id || matched.connectionId || matched.connection_id || null;
+          }
+        } catch (_) { }
+      }
+
       await new Promise(r => setTimeout(r, 2000));
       try {
         const res = await spindle.generate.quiet({
           userId,
+          connection_id: targetConnId,
+          connectionId: targetConnId,
           messages: [
             {
               role: "system",
