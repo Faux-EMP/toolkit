@@ -1353,135 +1353,49 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
   if (payload.toolName === "web_search") {
     const query = String(payload.args?.query || "").trim();
-    console.log("=== WEB SEARCH TRIGGERED ===", query, "userId:", userId);
-
+    console.log("=== WEB SEARCH TRIGGERED ===", query);
     let lastSearchErr = null;
+
     if (spindle.generate?.quiet) {
-      let nativeResult = null;
-      let targetConnId = payload?.connectionId || payload?.connection_id || cachedConnectionId;
-      let activeModel = "";
-
+      await new Promise(r => setTimeout(r, 2000));
       try {
-        const activeChatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
-        if (activeChatId && spindle.chat?.getMessages) {
-          const msgsRaw = await spindle.chat.getMessages(activeChatId, { limit: 10, userId }, userId);
-          const msgs = Array.isArray(msgsRaw) ? msgsRaw : (msgsRaw?.messages || msgsRaw?.data || []);
-          for (let i = msgs.length - 1; i >= 0; i--) {
-            const m = msgs[i]?.extra?.generationMetrics?.model || msgs[i]?.extra?.model || "";
-            if (m) {
-              activeModel = String(m).toLowerCase();
-              break;
+        const res = await spindle.generate.quiet({
+          userId,
+          messages: [
+            {
+              role: "system",
+              content: "Search the web and provide a detailed, factual summary."
+            },
+            {
+              role: "user",
+              content: query
             }
-          }
-        }
-      } catch (_) { }
-
-      const activeChatIsNonMain = activeModel && (
-        activeModel.includes("glm") ||
-        activeModel.includes("kimi") ||
-        activeModel.includes("moonshot")
-      );
-
-      if (!activeChatIsNonMain && spindle.connections?.list) {
-        try {
-          let connsRaw = null;
-          try {
-            connsRaw = await spindle.connections.list({ userId }, userId);
-          } catch (_) {
-            connsRaw = await spindle.connections.list(userId);
-          }
-          const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
-          const chatConns = list.filter(c => !/embed/i.test(c?.name || "") && !/embed/i.test(c?.model || ""));
-
-          const isNonMainConn = (c) => {
-            const blob = JSON.stringify(c || {}).toLowerCase();
-            return blob.includes("glm")
-              || blob.includes("kimi")
-              || blob.includes("moonshot")
-              || blob.includes("127.0.0.1")
-              || blob.includes("192.168.")
-              || blob.includes("localhost")
-              || blob.includes(":8085")
-              || blob.includes(":8787");
-          };
-
-          // 1. Match the exact model active in this chat, or 2. Pick the first Main Proxy connection
-          const matchedConn = (activeModel && chatConns.find(c => String(c.model || "").toLowerCase() === activeModel))
-            || (targetConnId && chatConns.find(c => (c.id || c.connectionId || c.connection_id) === targetConnId && !isNonMainConn(c)))
-            || chatConns.find(c => !isNonMainConn(c));
-
-          if (matchedConn) {
-            targetConnId = matchedConn.id || matchedConn.connectionId || matchedConn.connection_id || null;
-          }
-        } catch (e) {
-          lastSearchErr = `Connection lookup error: ${e.message}`;
-        }
-      }
-
-      if (!activeChatIsNonMain && targetConnId) {
-        // 2000ms buffer BEFORE calling Main Proxy so active stream slot settles
-        await new Promise(r => setTimeout(r, 2000));
-        try {
-          const quietReq = {
-            userId,
-            connection_id: targetConnId,
-            connectionId: targetConnId,
-            apiReasoning: false,
-            reasoningEffort: "none",
-            reasoning: { apiReasoning: false, reasoningEffort: "none" },
-            messages: [
-              {
-                role: "system",
-                content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
-              },
-              {
-                role: "user",
-                content: query
-              }
-            ]
-          };
-
-          console.log(`=== WEB SEARCH ROUTING VIA MAIN PROXY (${targetConnId} | model: ${activeModel || "default"}) ===`);
-          const res = await Promise.race([
-            spindle.generate.quiet(quietReq, userId),
-            new Promise((_, rej) => setTimeout(() => rej(new Error("Quiet native search timed out after 25s")), 25000))
-          ]);
-          const text = typeof res === "string"
-            ? res
-            : (res?.content || res?.text || res?.response || res?.message?.content || "");
-
-          if (text && String(text).trim().length > 0) {
-            nativeResult = `=== WEB SEARCH RESULTS (Native) ===\n${String(text).trim()}`;
-          } else {
-            lastSearchErr = "Main proxy returned empty search content.";
-          }
-        } catch (err) {
-          lastSearchErr = err.message;
-          console.warn("Quiet native search failed, falling back to SearXNG:", err.message);
-        } finally {
-          // 2000ms buffer AFTER calling Main Proxy so upstream connection closes cleanly
+          ]
+        }, userId);
+        const text = typeof res === "string"
+          ? res
+          : (res?.content || res?.text || res?.response || res?.message?.content || "");
+        if (text && String(text).trim().length > 0) {
           await new Promise(r => setTimeout(r, 2000));
+          return `=== WEB SEARCH RESULTS (Native) ===\n${String(text).trim()}`;
         }
-      } else {
-        lastSearchErr = `Skipped native search (activeModel=${activeModel || "unknown"}, targetConnId=${targetConnId || "none"}).`;
+        lastSearchErr = "Empty native search response.";
+      } catch (err) {
+        lastSearchErr = err.message;
       }
-
-      if (nativeResult) return nativeResult;
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     if (spindle.webSearch?.query) {
       try {
-        const search = await Promise.race([
-          spindle.webSearch.query({ query, count: 5, userId }, userId),
-          new Promise((_, rej) => setTimeout(() => rej(new Error("SearXNG request timed out after 8s")), 8000))
-        ]);
+        const search = await spindle.webSearch.query({ query, count: 5, userId }, userId);
         return `=== WEB SEARCH RESULTS (SearXNG) ===\n${search.context || JSON.stringify(search, null, 2)}`;
       } catch (err) {
-        return `Web search failed. Native error: ${lastSearchErr || "unknown"} | SearXNG error: ${err.message}`;
+        return `Web search failed. Native: ${lastSearchErr || "none"} | SearXNG: ${err.message}`;
       }
     }
 
-    return `Web search unavailable: ${lastSearchErr || "no search provider responded."}`;
+    return `Web search unavailable: ${lastSearchErr || "no provider responded."}`;
   }
 
   if (payload.toolName !== "recall_memory") return;
