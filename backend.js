@@ -495,10 +495,11 @@ async function syncFolderToDatabank(folder, chatId, userId, payload = null) {
     const isPrivate = folder.scope === "private" || folder.scope === "character";
     const ownerName = folder.owner || charInfo.name || "Assistant";
     const ownerId = folder.ownerId || (normalizeCharAlias(ownerName) === normalizeCharAlias(charInfo.name) ? charInfo.id : null);
-    const targetBankName = isPrivate ? `${ownerName}'s Archive` : "Archives";
+    const customBank = folder.databank ? String(folder.databank).trim() : "";
+    const targetBankName = customBank || (isPrivate ? `${ownerName}'s Archive` : "Archives");
     const targetBankDesc = isPrivate
       ? `Personal, private memory archive exclusively for ${ownerName}.`
-      : "Shared global knowledge archives managed by Toolkit.";
+      : (customBank ? `Databank for ${customBank} managed by Toolkit.` : "Shared global knowledge archives managed by Toolkit.");
 
     let targetBank = banks.find(b => String(b.name || "").toLowerCase().trim() === targetBankName.toLowerCase());
 
@@ -577,12 +578,138 @@ async function syncFolderToDatabank(folder, chatId, userId, payload = null) {
   return null;
 }
 
-async function saveMemoryFolder({ chatId, userId, payload, folderName, folderType, folderScope, description, facts, replaceFacts }) {
+function isAllowedDatabank(targetBankName, activeCharName) {
+  const lower = String(targetBankName || "").toLowerCase().trim();
+  if (!lower) return false;
+  if (lower.endsWith("'s archive")) {
+    const requestedOwner = normalizeCharAlias(lower.replace(/'s archive$/i, "").trim());
+    const activeOwner = normalizeCharAlias(activeCharName || "Assistant");
+    return requestedOwner === activeOwner;
+  }
+  return true;
+}
+
+async function saveDatabankFile({ chatId, userId, payload, databankName, fileName, fileContent, deleteFile = false }) {
+  if (!spindle.databanks) return { ok: false, error: "Databanks API unavailable." };
+  const uId = await ensureUserId(userId);
+  const charInfo = await getActiveCharacterInfo(chatId, uId, payload);
+
+  const targetBankName = String(databankName || "Archives").trim();
+  if (!isAllowedDatabank(targetBankName, charInfo.name)) {
+    return { ok: false, error: `Access denied: ${charInfo.name} cannot modify ${targetBankName}.` };
+  }
+
+  const rawFileName = String(fileName || "").trim();
+  if (!rawFileName) return { ok: false, error: "file_name is required." };
+  const normalizedFileName = rawFileName.toLowerCase().endsWith(".md") ? rawFileName : `${rawFileName}.md`;
+  const cleanTarget = rawFileName.replace(/^\[.*?\]\s*/, "").replace(/\.md$/i, "").trim().toLowerCase();
+
+  try {
+    let rawBanks = null;
+    try {
+      rawBanks = await spindle.databanks.list({ userId: uId }, uId);
+    } catch (e1) {
+      rawBanks = await spindle.databanks.list(uId);
+    }
+    const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
+    let targetBank = banks.find(b => String(b.name || "").toLowerCase().trim() === targetBankName.toLowerCase());
+
+    if (!targetBank) {
+      if (deleteFile) {
+        return { ok: false, error: `Databank '${targetBankName}' not found.` };
+      }
+      if (spindle.databanks.create) {
+        targetBank = await spindle.databanks.create({
+          name: targetBankName,
+          description: `Databank for ${targetBankName} managed by Toolkit.`,
+          scope: "global",
+          enabled: false,
+          userId: uId
+        }, uId);
+        console.log(`=== DATABANK CREATED: ${targetBankName} ===`);
+      }
+    }
+
+    const bankId = targetBank?.id || targetBank?.databankId || targetBank?.data?.id;
+    if (!bankId) return { ok: false, error: `Could not resolve databank ID for '${targetBankName}'.` };
+
+    const docApi = spindle.databanks.documents;
+    if (!docApi) return { ok: false, error: "spindle.databanks.documents unavailable." };
+
+    let existingDoc = null;
+    if (docApi.list) {
+      let rawDocs = null;
+      try {
+        rawDocs = await docApi.list(bankId, { limit: 100, userId: uId }, uId);
+      } catch (e2) {
+        rawDocs = await docApi.list(bankId, uId);
+      }
+      const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.data || rawDocs?.documents || []);
+      existingDoc = docs.find(d => {
+        const dRaw = String(d.filename || d.name || d.title || "").trim().toLowerCase();
+        const dClean = dRaw.replace(/^\[.*?\]\s*/, "").replace(/\.md$/i, "").trim();
+        return dRaw === normalizedFileName.toLowerCase() || dClean === cleanTarget;
+      });
+    }
+
+    if (existingDoc?.id && docApi.delete) {
+      try {
+        await docApi.delete(existingDoc.id, uId);
+      } catch (e3) {
+        await docApi.delete(bankId, existingDoc.id, uId);
+      }
+    }
+
+    if (deleteFile) {
+      if (!existingDoc?.id) {
+        return { ok: false, error: `File '${normalizedFileName}' was not found in '${targetBank.name || targetBankName}'.` };
+      }
+      console.log(`=== DATABANK FILE DELETED: ${normalizedFileName} from ${targetBankName} ===`);
+      return {
+        ok: true,
+        action: "deleted",
+        databank: targetBank.name || targetBankName,
+        filename: existingDoc.filename || existingDoc.name || normalizedFileName
+      };
+    }
+
+    const contentStr = String(fileContent ?? "");
+    const bytes = new TextEncoder().encode(contentStr);
+    if (docApi.create) {
+      await docApi.create(bankId, {
+        filename: normalizedFileName,
+        mime_type: "text/markdown",
+        data: bytes,
+        userId: uId
+      }, uId);
+    }
+
+    const lineCount = contentStr.split(/\r?\n/).length;
+    console.log(`=== DATABANK FILE SAVED: ${normalizedFileName} in ${targetBankName} (${lineCount} lines) ===`);
+    return {
+      ok: true,
+      action: existingDoc?.id ? "updated" : "created",
+      databank: targetBank.name || targetBankName,
+      filename: normalizedFileName,
+      lines: lineCount
+    };
+  } catch (err) {
+    console.warn("saveDatabankFile error:", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+async function saveMemoryFolder({ chatId, userId, payload, folderName, folderType, folderScope, databankName, description, facts, replaceFacts }) {
   const uId = await ensureUserId(userId);
   const cleanName = String(folderName || "").trim();
   if (!cleanName) return null;
 
   const charInfo = await getActiveCharacterInfo(chatId, uId, payload);
+  if (databankName && !isAllowedDatabank(databankName, charInfo.name)) {
+    console.warn(`Blocked unauthorized databank access to ${databankName}`);
+    return null;
+  }
+
   const key = cleanName.toLowerCase();
   const allFolders = await getGlobalFolders(uId, true);
   const existing = allFolders[key] || {
@@ -591,6 +718,7 @@ async function saveMemoryFolder({ chatId, userId, payload, folderName, folderTyp
     scope: "shared",
     owner: null,
     ownerId: null,
+    databank: null,
     description: "",
     facts: [],
     createdAt: Date.now(),
@@ -599,6 +727,7 @@ async function saveMemoryFolder({ chatId, userId, payload, folderName, folderTyp
 
   if (folderType) existing.type = folderType;
   if (description) existing.description = description;
+  if (databankName) existing.databank = String(databankName).trim();
   if (folderScope) {
     const s = String(folderScope).toLowerCase().trim();
     existing.scope = (s === "private" || s === "character" || s === "personal") ? "private" : "shared";
@@ -1016,44 +1145,44 @@ function cleanEntity(e) {
 }
 
 function getChunkOrder(c) {
- if (!c) return 0;
- const start = getChunkStartIdx(c) ?? c.start_index ?? c.start_message_index ?? c.message_index;
- if (start !== undefined) return Number(start);
- const idx = c.chunk_index ?? c.chunkIndex ?? c.index ?? c.seq ?? c.sequence ?? c._arrIdx;
- if (idx !== undefined) return Number(idx);
- return 0;
+  if (!c) return 0;
+  const start = getChunkStartIdx(c) ?? c.start_index ?? c.start_message_index ?? c.message_index;
+  if (start !== undefined) return Number(start);
+  const idx = c.chunk_index ?? c.chunkIndex ?? c.index ?? c.seq ?? c.sequence ?? c._arrIdx;
+  if (idx !== undefined) return Number(idx);
+  return 0;
 }
 
 function formatAndSortChunks(chunks) {
- const sorted = [...chunks].sort((a, b) => {
-  const idxA = getChunkOrder(a);
-  const idxB = getChunkOrder(b);
-  if (idxA !== idxB) return idxA - idxB;
-  const tA = Number(Array.isArray(a.timeRange) ? a.timeRange[0] : (a.timestamp || a.created_at || a.createdAt || 0));
-  const tB = Number(Array.isArray(b.timeRange) ? b.timeRange[0] : (b.timestamp || b.created_at || b.createdAt || 0));
-  return tA - tB;
- });
+  const sorted = [...chunks].sort((a, b) => {
+    const idxA = getChunkOrder(a);
+    const idxB = getChunkOrder(b);
+    if (idxA !== idxB) return idxA - idxB;
+    const tA = Number(Array.isArray(a.timeRange) ? a.timeRange[0] : (a.timestamp || a.created_at || a.createdAt || 0));
+    const tB = Number(Array.isArray(b.timeRange) ? b.timeRange[0] : (b.timestamp || b.created_at || b.createdAt || 0));
+    return tA - tB;
+  });
 
- return sorted.map((c, i) => {
-  const parts = [];
-  if (c._latestTag) parts.push(c._latestTag);
-  const cIdx = c.chunk_index ?? c.chunkIndex ?? c.index ?? c._arrIdx;
-  if (cIdx !== undefined) parts.push(`Chunk #${cIdx}`);
+  return sorted.map((c, i) => {
+    const parts = [];
+    if (c._latestTag) parts.push(c._latestTag);
+    const cIdx = c.chunk_index ?? c.chunkIndex ?? c.index ?? c._arrIdx;
+    if (cIdx !== undefined) parts.push(`Chunk #${cIdx}`);
 
-  const startMsg = getChunkStartIdx(c) ?? c.start_index ?? c.start_message_index;
-  const endMsg = getChunkEndIdx(c) ?? c.end_index ?? c.end_message_index;
-  if (startMsg !== undefined && endMsg !== undefined) {
-   parts.push(startMsg === endMsg ? `Message #${startMsg}` : `Messages #${startMsg}-#${endMsg}`);
-  } else if (startMsg !== undefined) {
-   parts.push(`Message #${startMsg}`);
-  }
+    const startMsg = getChunkStartIdx(c) ?? c.start_index ?? c.start_message_index;
+    const endMsg = getChunkEndIdx(c) ?? c.end_index ?? c.end_message_index;
+    if (startMsg !== undefined && endMsg !== undefined) {
+      parts.push(startMsg === endMsg ? `Message #${startMsg}` : `Messages #${startMsg}-#${endMsg}`);
+    } else if (startMsg !== undefined) {
+      parts.push(`Message #${startMsg}`);
+    }
 
-  const timeStr = formatTime(c.timestamp || c.timeRange || c.time_range || c.created_at || c.createdAt || c.updated_at || c.updatedAt);
-  if (timeStr) parts.push(`Time: ${timeStr}`);
+    const timeStr = formatTime(c.timestamp || c.timeRange || c.time_range || c.created_at || c.createdAt || c.updated_at || c.updatedAt);
+    if (timeStr) parts.push(`Time: ${timeStr}`);
 
-  const header = parts.length > 0 ? `[${parts.join(" | ")}]\n` : `[Excerpt #${i + 1}]\n`;
-  return header + (c.content || c.text || "");
- });
+    const header = parts.length > 0 ? `[${parts.join(" | ")}]\n` : `[Excerpt #${i + 1}]\n`;
+    return header + (c.content || c.text || "");
+  });
 }
 
 spindle.registerTool({
@@ -1095,6 +1224,22 @@ spindle.registerTool({
       folder_replace: {
         type: "boolean",
         description: "Optional: set to true to completely replace the folder's existing facts list with folder_facts."
+      },
+      databank_name: {
+        type: "string",
+        description: "Optional: target any specific Lumiverse Databank by name (e.g., 'Project #4', 'Toolkit', 'Castle Proxy', 'Archives'). Creates the databank with Global Injection OFF if it doesn't exist."
+      },
+      file_name: {
+        type: "string",
+        description: "Optional: filename (e.g., 'backend.js.md', 'tree_project_four.md') to create, update, or delete directly inside databank_name."
+      },
+      file_content: {
+        type: "string",
+        description: "Optional: raw markdown or code text to write directly into file_name inside databank_name (bypasses bullet-point numbering for 1-to-1 raw files)."
+      },
+      delete_file: {
+        type: "boolean",
+        description: "Optional: set to true along with databank_name and file_name to delete that document from the databank."
       }
     },
     required: ["query"]
@@ -1122,325 +1267,365 @@ spindle.registerTool({
 });
 
 function stripChunkOverlaps(rawText) {
- const lines = String(rawText || "").split(/\r?\n/);
- const clean = [];
- let i = 0;
- while (i < lines.length) {
-  let  duplicateLen = 0;
-  const maxWin = Math.min(45, clean.length, lines.length - i);
-  for (let w = maxWin; w >= 2; w--) {
-   let match = true;
-   for (let k = 0; k < w; k++) {
-    if (clean[clean.length - w + k].trim() !== lines[i + k].trim()) {
-     match = false;
-     break;
+  const lines = String(rawText || "").split(/\r?\n/);
+  const clean = [];
+  let i = 0;
+  while (i < lines.length) {
+    let duplicateLen = 0;
+    const maxWin = Math.min(45, clean.length, lines.length - i);
+    for (let w = maxWin; w >= 2; w--) {
+      let match = true;
+      for (let k = 0; k < w; k++) {
+        if (clean[clean.length - w + k].trim() !== lines[i + k].trim()) {
+          match = false;
+          break;
+        }
+      }
+      // Require at least one non-trivial line so closing braces alone don't false-trigger
+      if (match && lines.slice(i, i + w).some(l => l.trim().length > 12)) {
+        duplicateLen = w;
+        break;
+      }
     }
-   }
-   // Require at least one non-trivial line so closing braces alone don't false-trigger
-   if (match && lines.slice(i, i + w).some(l => l.trim().length > 12)) {
-    duplicateLen = w;
-    break;
-   }
+    if (duplicateLen > 0) {
+      i += duplicateLen;
+    } else {
+      clean.push(lines[i]);
+      i++;
+    }
   }
-  if (duplicateLen > 0) {
-   i += duplicateLen;
-  } else {
-   clean.push(lines[i]);
-   i++;
-  }
- }
- return clean.join("\n");
+  return clean.join("\n");
 }
 
 async function getRawDatabankFiles(uId, activeCharName) {
- if (!spindle.databanks?.list || !spindle.databanks?.documents?.list) return [];
- const rawFiles = [];
- try {
-  let rawBanks = null;
+  if (!spindle.databanks?.list || !spindle.databanks?.documents?.list) return [];
+  const rawFiles = [];
   try {
-   rawBanks = await spindle.databanks.list({ userId: uId }, uId);
-  } catch (e1) {
-   rawBanks = await spindle.databanks.list(uId);
-  }
-  const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
-  const charArchiveName = `${String(activeCharName || "Assistant").toLowerCase().trim()}'s archive`;
-  const targetBanks = banks.filter(b => {
-   const n = String(b?.name || "").toLowerCase().trim();
-   if (!n) return false;
-   if (n.endsWith("'s archive")) return n === charArchiveName;
-   return true; // Scan 'Archives' AND any dedicated project databank!
-  });
-
-  const docApi = spindle.databanks.documents;
-  for (const bank of targetBanks) {
-   const bankId = bank?.id || bank?.databankId;
-   if (!bankId) continue;
-   let rawDocs = null;
-   try {
-    rawDocs = await docApi.list(bankId, { limit: 100, userId: uId }, uId);
-   } catch (e2) {
-    rawDocs = await docApi.list(bankId, uId);
-   }
-   const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.data || rawDocs?.documents || []);
-   for (const d of docs) {
-    const rawTitle = String(d.filename || d.name || d.title || "").trim();
-    if (!rawTitle) continue;
-    const mdText = await readDatabankDocText(docApi, bankId, d, uId);
-    if (!mdText) continue;
-    if (/^##\s*Compiled\s+Facts/im.test(mdText)) continue;
-    const cleanName = rawTitle.replace(/^\[.*?\]\s*/, "").replace(/\.md$/i, "").trim();
-    rawFiles.push({
-     filename: rawTitle,
-     cleanName,
-     bankName: bank.name,
-     content: stripChunkOverlaps(mdText)
+    let rawBanks = null;
+    try {
+      rawBanks = await spindle.databanks.list({ userId: uId }, uId);
+    } catch (e1) {
+      rawBanks = await spindle.databanks.list(uId);
+    }
+    const banks = Array.isArray(rawBanks) ? rawBanks : (rawBanks?.databanks || rawBanks?.data || []);
+    const charArchiveName = `${String(activeCharName || "Assistant").toLowerCase().trim()}'s archive`;
+    const targetBanks = banks.filter(b => {
+      const n = String(b?.name || "").toLowerCase().trim();
+      if (!n) return false;
+      if (n.endsWith("'s archive")) return n === charArchiveName;
+      return true; // Scan 'Archives' AND any dedicated project databank!
     });
-   }
+
+    const docApi = spindle.databanks.documents;
+    for (const bank of targetBanks) {
+      const bankId = bank?.id || bank?.databankId;
+      if (!bankId) continue;
+      let rawDocs = null;
+      try {
+        rawDocs = await docApi.list(bankId, { limit: 100, userId: uId }, uId);
+      } catch (e2) {
+        rawDocs = await docApi.list(bankId, uId);
+      }
+      const docs = Array.isArray(rawDocs) ? rawDocs : (rawDocs?.data || rawDocs?.documents || []);
+      for (const d of docs) {
+        const rawTitle = String(d.filename || d.name || d.title || "").trim();
+        if (!rawTitle) continue;
+        const mdText = await readDatabankDocText(docApi, bankId, d, uId);
+        if (!mdText) continue;
+        if (/^##\s*Compiled\s+Facts/im.test(mdText)) continue;
+        const cleanName = rawTitle.replace(/^\[.*?\]\s*/, "").replace(/\.md$/i, "").trim();
+        rawFiles.push({
+          filename: rawTitle,
+          cleanName,
+          bankName: bank.name,
+          content: stripChunkOverlaps(mdText)
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("Raw databank file scan warning:", err.message);
   }
- } catch (err) {
-  console.warn("Raw databank file scan warning:", err.message);
- }
- return rawFiles;
+  return rawFiles;
 }
 
 spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
- const userId = await ensureUserId(resolveUserId(eventUserId) || resolveUserId(payload));
+  const userId = await ensureUserId(resolveUserId(eventUserId) || resolveUserId(payload));
 
- if (payload.toolName === "web_search") {
-  const query = String(payload.args?.query || "").trim();
-  console.log("=== WEB SEARCH TRIGGERED ===", query, "userId:", userId);
+  if (payload.toolName === "web_search") {
+    const query = String(payload.args?.query || "").trim();
+    console.log("=== WEB SEARCH TRIGGERED ===", query, "userId:", userId);
 
-  let lastSearchErr = null;
-  if (spindle.generate?.quiet) {
-   let nativeResult = null;
-   let targetConnId = payload?.connectionId || payload?.connection_id || cachedConnectionId;
+    let lastSearchErr = null;
+    if (spindle.generate?.quiet) {
+      let nativeResult = null;
+      let targetConnId = payload?.connectionId || payload?.connection_id || cachedConnectionId;
 
-   if (spindle.connections?.list) {
-    try {
-     const connsRaw = await spindle.connections.list(userId);
-     const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
-     // Filter out GLM, Kimi, and local 127.0.0.1 / 192.168 test proxies
-     const mainCandidates = list.filter(c => {
-      const blob = JSON.stringify(c || {}).toLowerCase();
-      return !blob.includes("glm") && !blob.includes("kimi") && !blob.includes("moonshot") && !blob.includes("127.0.0.1") && !blob.includes("192.168.");
-     });
-     const cachedIsSafe = targetConnId && mainCandidates.some(c => (c.id || c.connectionId || c.connection_id) === targetConnId);
-     if (!cachedIsSafe) {
-      targetConnId = null; // Active connection is Castle / GLM / Kimi -> skip quiet search and go straight to SearXNG!
-     }
-    } catch (_) { }
-   }
+      if (spindle.connections?.list) {
+        try {
+          const connsRaw = await spindle.connections.list(userId);
+          const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
+          const chatConns = list.filter(c => !/embed/i.test(c?.name || "") && !/embed/i.test(c?.model || ""));
 
-   if (targetConnId) {
-    // 2000ms buffer BEFORE calling Main Proxy so active stream slot settles
-    await new Promise(r => setTimeout(r, 2000));
-    try {
-     const quietReq = {
-      userId,
-      connection_id: targetConnId,
-      connectionId: targetConnId,
-      messages: [
-       {
-        role: "system",
-        content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
-       },
-       {
-        role: "user",
-        content: query
-       }
-      ]
-     };
+          // Resolve the active/default connection when targetConnId isn't passed in event payloads
+          const activeConn = (targetConnId && chatConns.find(c => (c.id || c.connectionId || c.connection_id) === targetConnId))
+            || chatConns.find(c => c.is_default || c.isDefault || c.active || c.is_active)
+            || chatConns[0];
 
-     console.log(`=== WEB SEARCH ROUTING VIA MAIN PROXY (${targetConnId}) ===`);
-     const res = await spindle.generate.quiet(quietReq, userId);
-     const text = typeof res === "string"
-      ? res
-      : (res?.content || res?.text || res?.response || res?.message?.content || "");
+          if (activeConn) {
+            const blob = JSON.stringify(activeConn).toLowerCase();
+            const isNonMain = blob.includes("glm")
+              || blob.includes("kimi")
+              || blob.includes("moonshot")
+              || blob.includes("127.0.0.1")
+              || blob.includes("192.168.")
+              || blob.includes("localhost")
+              || blob.includes(":8085")
+              || blob.includes(":8787");
 
-     if (text && String(text).trim().length > 0) {
-      nativeResult = `=== WEB SEARCH RESULTS (Native) ===\n${String(text).trim()}`;
-     } else {
-      lastSearchErr = "Main proxy returned empty search content.";
-     }
-    } catch (err) {
-     lastSearchErr = err.message;
-     console.warn("Quiet native search failed, falling back to SearXNG:", err.message);
-    } finally {
-     // 2000ms buffer AFTER calling Main Proxy so upstream connection closes cleanly
-     await new Promise(r => setTimeout(r, 2000));
-    }
-   } else {
-    lastSearchErr = "Skipped native search (active connection is non-Main proxy).";
-    console.log("=== WEB SEARCH: Non-Main proxy active, jumping straight to SearXNG ===");
-   }
-
-   if (nativeResult) return nativeResult;
-  }
-
-  if (spindle.webSearch?.query) {
-   try {
-    const search = await spindle.webSearch.query({ query, count: 5, userId }, userId);
-    return `=== WEB SEARCH RESULTS (SearXNG) ===\n${search.context || JSON.stringify(search, null, 2)}`;
-   } catch (err) {
-    return `Web search failed. Native error: ${lastSearchErr || "unknown"} | SearXNG error: ${err.message}`;
-   }
-  }
-
-  return `Web search unavailable: ${lastSearchErr || "no search provider responded."}`;
- }
-
- if (payload.toolName !== "recall_memory") return;
-
- const query = String(payload.args?.query || "").trim();
- const requestedMode = String(payload.args?.vault_mode || "").trim().toLowerCase();
- const folderName = String(payload.args?.folder_name || "").trim();
-
- const chatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
-
- if (query === "__inspect__") {
-  return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId, payload);
- }
-
- const charInfo = await getActiveCharacterInfo(chatId, userId, payload);
- const results = [];
-
- if (folderName) {
-  const savedFolder = await saveMemoryFolder({
-   chatId,
-   userId,
-   payload,
-   folderName,
-   folderType: payload.args?.folder_type,
-   folderScope: payload.args?.folder_scope,
-   description: payload.args?.folder_description,
-   facts: payload.args?.folder_facts,
-   replaceFacts: Boolean(payload.args?.folder_replace)
-  });
-  if (savedFolder) {
-   results.push(`=== ARCHIVE UPDATED: ${savedFolder.name} (${savedFolder.scope === "private" ? `${savedFolder.owner}'s Archive` : "Archives"}) ===\n` + JSON.stringify({
-    name: savedFolder.name,
-    type: savedFolder.type,
-    scope: savedFolder.scope,
-    owner: savedFolder.owner,
-    description: savedFolder.description,
-    totalFacts: savedFolder.facts.length,
-    facts: savedFolder.facts,
-    lastUpdated: formatTime(savedFolder.updatedAt)
-   }, null, 2));
-  }
- }
-
- if (requestedMode === "all" || query.includes("__all_vaults__")) {
-  const res = await setVaultMode(chatId, userId, "all");
-  if (query === "__all_vaults__" && !folderName) return res.label;
- } else if (requestedMode === "strict" || query.includes("__strict_vaults__")) {
-  const res = await setVaultMode(chatId, userId, "strict");
-  if (query === "__strict_vaults__" && !folderName) return res.label;
- } else if (requestedMode === "toggle" || query.includes("__toggle_vaults__")) {
-  const res = await setVaultMode(chatId, userId, "toggle");
-  if (query === "__toggle_vaults__" && !folderName) return res.label;
- }
-
- const allFolders = await getGlobalFolders(userId);
- const accessibleFolders = Object.values(allFolders).filter(f => canCharacterAccessFolder(f, charInfo.name, charInfo.id));
- const rawFiles = await getRawDatabankFiles(userId, charInfo.name);
-
- if (query === "__list_folders__") {
-  if (accessibleFolders.length === 0 && rawFiles.length === 0) return "No Archive folders have been created yet.";
-  return "=== ACCESSIBLE ARCHIVE FOLDERS ===\n" + JSON.stringify({
-   compiledDossiers: accessibleFolders.map(f => ({
-    name: f.name,
-    type: f.type,
-    archive: f.scope === "private" ? `${f.owner}'s Archive` : "Archives",
-    description: f.description,
-    factCount: f.facts?.length || 0,
-    facts: f.facts,
-    lastUpdated: formatTime(f.updatedAt)
-   })),
-   rawFiles: rawFiles.map(rf => ({
-    filename: rf.filename,
-    archive: rf.bankName,
-    lines: rf.content.split(/\r?\n/).length
-   }))
-  }, null, 2);
- }
-
- const keywords = extractKeywords(query);
- const vaultMode = await getVaultMode(chatId, userId);
- console.log("=== MEMORY RECALL TRIGGERED ===", query, "vaultMode:", vaultMode, "char:", charInfo.name);
-
- try {
-  const attachedLinks = (chatId && spindle.memories?.links?.list)
-   ? await spindle.memories.links.list(chatId, userId)
-   : [];
-  const activeLinks = (attachedLinks || []).filter(l => l.enabled !== false);
-
-  const allVaults = spindle.memories?.vaults?.list
-   ? await spindle.memories.vaults.list(userId)
-   : [];
-  const vaultIdMap = new Map((allVaults || []).map(v => [v.id, v]));
-
-  const attachedVaults = [];
-  const interlinkedChatIds = new Set();
-
-  for (const link of activeLinks) {
-   const vId = link.vaultId || link.targetVaultId || link.sourceVaultId || (vaultIdMap.has(link.targetId) ? link.targetId : null);
-   if (vId && vaultIdMap.has(vId)) {
-    attachedVaults.push(vaultIdMap.get(vId));
-    continue;
-   }
-   const cId = link.targetChatId || link.linkedChatId || link.sourceChatId || link.targetId || (link.chatId !== chatId ? link.chatId : null);
-   if (cId && cId !== chatId && !vaultIdMap.has(cId)) {
-    interlinkedChatIds.add(cId);
-   }
-  }
-
-  const vaultsToSearch = vaultMode === "all" ? (allVaults || []) : attachedVaults;
-  const vaultNames = vaultsToSearch.map(v => v.name).join(", ") || "None";
-  results.unshift(`[Vault Recall Mode: ${vaultMode.toUpperCase()} | Active Character: ${charInfo.name} | Accessible Archives: ${accessibleFolders.length} (+${rawFiles.length} Raw) | Searching Vaults (${vaultsToSearch.length}): ${vaultNames} | Active Interlinks: ${interlinkedChatIds.size}]`);
-
-  if (accessibleFolders.length > 0 && keywords.length > 0) {
-   const matchedFolders = accessibleFolders.filter(f =>
-    matchesKeywords(f.name, keywords) ||
-    matchesKeywords(f.description, keywords) ||
-    matchesKeywords(JSON.stringify(f.facts || []), keywords)
-   );
-   if (matchedFolders.length > 0) {
-    results.push("=== ARCHIVES (Compiled Dossiers) ===\n" + JSON.stringify(matchedFolders.map(f => ({
-     name: f.name,
-     type: f.type,
-     archive: f.scope === "private" ? `${f.owner}'s Archive` : "Archives",
-     description: f.description,
-     facts: f.facts,
-     lastUpdated: formatTime(f.updatedAt)
-    })), null, 2));
-   }
-  }
-
-  // Check Raw Files (like backend.js.md) only when explicitly named in query!
-  if (rawFiles.length > 0 && keywords.length > 0) {
-   const qLower = query.toLowerCase();
-   for (const rf of rawFiles) {
-    const fullLower = rf.cleanName.toLowerCase();
-    const stemLower = fullLower.replace(/\.[a-z0-9]+$/i, "");
-    if (qLower.includes(fullLower) || (stemLower.length >= 4 && qLower.includes(stemLower))) {
-     const lines = rf.content.split(/\r?\n/);
-     const extraKws = keywords.filter(k => k !== fullLower && k !== stemLower && !rf.filename.toLowerCase().includes(k));
-     const matchedLineNums = [];
-     const numberedLines = lines.map((lineText, idx) => {
-      const lineNum = idx + 1;
-      if (extraKws.length > 0 && extraKws.some(k => lineText.toLowerCase().includes(k))) {
-       matchedLineNums.push(lineNum);
+            targetConnId = isNonMain ? null : (activeConn.id || activeConn.connectionId || activeConn.connection_id || null);
+          }
+        } catch (_) { }
       }
-      return `${lineNum}: ${lineText}`;
-     });
-     const matchHeader = matchedLineNums.length > 0
-      ? `[Keyword matches (${extraKws.join(", ")}) on lines: ${matchedLineNums.slice(0, 80).join(", ")}]\n`
-      : "";
-     results.push(`=== RAW ARCHIVE FILE: ${rf.filename} (${lines.length} lines) ===\n${matchHeader}${numberedLines.join("\n")}`);
+
+      if (targetConnId) {
+        // 2000ms buffer BEFORE calling Main Proxy so active stream slot settles
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const quietReq = {
+            userId,
+            connection_id: targetConnId,
+            connectionId: targetConnId,
+            apiReasoning: false,
+            reasoningEffort: "none",
+            reasoning: { apiReasoning: false, reasoningEffort: "none" },
+            messages: [
+              {
+                role: "system",
+                content: "Search the web and provide a detailed, factual summary with source names and URLs if available."
+              },
+              {
+                role: "user",
+                content: query
+              }
+            ]
+          };
+
+          console.log(`=== WEB SEARCH ROUTING VIA MAIN PROXY (${targetConnId}) ===`);
+          const res = await Promise.race([
+            spindle.generate.quiet(quietReq, userId),
+            new Promise((_, rej) => setTimeout(() => rej(new Error("Quiet native search timed out after 20s")), 20000))
+          ]);
+          const text = typeof res === "string"
+            ? res
+            : (res?.content || res?.text || res?.response || res?.message?.content || "");
+
+          if (text && String(text).trim().length > 0) {
+            nativeResult = `=== WEB SEARCH RESULTS (Native) ===\n${String(text).trim()}`;
+          } else {
+            lastSearchErr = "Main proxy returned empty search content.";
+          }
+        } catch (err) {
+          lastSearchErr = err.message;
+          console.warn("Quiet native search failed, falling back to SearXNG:", err.message);
+        } finally {
+          // 2000ms buffer AFTER calling Main Proxy so upstream connection closes cleanly
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      } else {
+        lastSearchErr = "Skipped native search (active connection is non-Main proxy).";
+        console.log("=== WEB SEARCH: Non-Main proxy active, jumping straight to SearXNG ===");
+      }
+
+      if (nativeResult) return nativeResult;
     }
-   }
+
+    if (spindle.webSearch?.query) {
+      try {
+        const search = await Promise.race([
+          spindle.webSearch.query({ query, count: 5, userId }, userId),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("SearXNG request timed out after 8s")), 8000))
+        ]);
+        return `=== WEB SEARCH RESULTS (SearXNG) ===\n${search.context || JSON.stringify(search, null, 2)}`;
+      } catch (err) {
+        return `Web search failed. Native error: ${lastSearchErr || "unknown"} | SearXNG error: ${err.message}`;
+      }
+    }
+
+    return `Web search unavailable: ${lastSearchErr || "no search provider responded."}`;
   }
+
+  if (payload.toolName !== "recall_memory") return;
+
+  const query = String(payload.args?.query || "").trim();
+  const requestedMode = String(payload.args?.vault_mode || "").trim().toLowerCase();
+  const folderName = String(payload.args?.folder_name || "").trim();
+  const databankName = String(payload.args?.databank_name || "").trim();
+  const fileName = String(payload.args?.file_name || "").trim();
+  const hasFileContent = payload.args?.file_content !== undefined && payload.args?.file_content !== null;
+  const deleteFile = Boolean(payload.args?.delete_file);
+
+  const chatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
+
+  if (query === "__inspect__") {
+    return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId, payload);
+  }
+
+  const charInfo = await getActiveCharacterInfo(chatId, userId, payload);
+  const results = [];
+
+  if (fileName && (hasFileContent || deleteFile)) {
+    const fileRes = await saveDatabankFile({
+      chatId,
+      userId,
+      payload,
+      databankName: databankName || "Archives",
+      fileName,
+      fileContent: payload.args?.file_content,
+      deleteFile
+    });
+    results.push(`=== DATABANK FILE OPERATION ===\n` + JSON.stringify(fileRes, null, 2));
+  }
+
+  if (folderName) {
+    const savedFolder = await saveMemoryFolder({
+      chatId,
+      userId,
+      payload,
+      folderName,
+      folderType: payload.args?.folder_type,
+      folderScope: payload.args?.folder_scope,
+      databankName: databankName || null,
+      description: payload.args?.folder_description,
+      facts: payload.args?.folder_facts,
+      replaceFacts: Boolean(payload.args?.folder_replace)
+    });
+    if (savedFolder) {
+      const targetLabel = savedFolder.databank || (savedFolder.scope === "private" ? `${savedFolder.owner}'s Archive` : "Archives");
+      results.push(`=== ARCHIVE UPDATED: ${savedFolder.name} (${targetLabel}) ===\n` + JSON.stringify({
+        name: savedFolder.name,
+        type: savedFolder.type,
+        scope: savedFolder.scope,
+        databank: targetLabel,
+        owner: savedFolder.owner,
+        description: savedFolder.description,
+        totalFacts: savedFolder.facts.length,
+        facts: savedFolder.facts,
+        lastUpdated: formatTime(savedFolder.updatedAt)
+      }, null, 2));
+    }
+  }
+
+  if (requestedMode === "all" || query.includes("__all_vaults__")) {
+    const res = await setVaultMode(chatId, userId, "all");
+    if (query === "__all_vaults__" && !folderName) return res.label;
+  } else if (requestedMode === "strict" || query.includes("__strict_vaults__")) {
+    const res = await setVaultMode(chatId, userId, "strict");
+    if (query === "__strict_vaults__" && !folderName) return res.label;
+  } else if (requestedMode === "toggle" || query.includes("__toggle_vaults__")) {
+    const res = await setVaultMode(chatId, userId, "toggle");
+    if (query === "__toggle_vaults__" && !folderName) return res.label;
+  }
+
+  const allFolders = await getGlobalFolders(userId);
+  const accessibleFolders = Object.values(allFolders).filter(f => canCharacterAccessFolder(f, charInfo.name, charInfo.id));
+  const rawFiles = await getRawDatabankFiles(userId, charInfo.name);
+
+  if (query === "__list_folders__") {
+    if (accessibleFolders.length === 0 && rawFiles.length === 0) return "No Archive folders have been created yet.";
+    return "=== ACCESSIBLE ARCHIVE FOLDERS ===\n" + JSON.stringify({
+      compiledDossiers: accessibleFolders.map(f => ({
+        name: f.name,
+        type: f.type,
+        archive: f.scope === "private" ? `${f.owner}'s Archive` : "Archives",
+        description: f.description,
+        factCount: f.facts?.length || 0,
+        facts: f.facts,
+        lastUpdated: formatTime(f.updatedAt)
+      })),
+      rawFiles: rawFiles.map(rf => ({
+        filename: rf.filename,
+        archive: rf.bankName,
+        lines: rf.content.split(/\r?\n/).length
+      }))
+    }, null, 2);
+  }
+
+  const keywords = extractKeywords(query);
+  const vaultMode = await getVaultMode(chatId, userId);
+  console.log("=== MEMORY RECALL TRIGGERED ===", query, "vaultMode:", vaultMode, "char:", charInfo.name);
+
+  try {
+    const attachedLinks = (chatId && spindle.memories?.links?.list)
+      ? await spindle.memories.links.list(chatId, userId)
+      : [];
+    const activeLinks = (attachedLinks || []).filter(l => l.enabled !== false);
+
+    const allVaults = spindle.memories?.vaults?.list
+      ? await spindle.memories.vaults.list(userId)
+      : [];
+    const vaultIdMap = new Map((allVaults || []).map(v => [v.id, v]));
+
+    const attachedVaults = [];
+    const interlinkedChatIds = new Set();
+
+    for (const link of activeLinks) {
+      const vId = link.vaultId || link.targetVaultId || link.sourceVaultId || (vaultIdMap.has(link.targetId) ? link.targetId : null);
+      if (vId && vaultIdMap.has(vId)) {
+        attachedVaults.push(vaultIdMap.get(vId));
+        continue;
+      }
+      const cId = link.targetChatId || link.linkedChatId || link.sourceChatId || link.targetId || (link.chatId !== chatId ? link.chatId : null);
+      if (cId && cId !== chatId && !vaultIdMap.has(cId)) {
+        interlinkedChatIds.add(cId);
+      }
+    }
+
+    const vaultsToSearch = vaultMode === "all" ? (allVaults || []) : attachedVaults;
+    const vaultNames = vaultsToSearch.map(v => v.name).join(", ") || "None";
+    results.unshift(`[Vault Recall Mode: ${vaultMode.toUpperCase()} | Active Character: ${charInfo.name} | Accessible Archives: ${accessibleFolders.length} (+${rawFiles.length} Raw) | Searching Vaults (${vaultsToSearch.length}): ${vaultNames} | Active Interlinks: ${interlinkedChatIds.size}]`);
+
+    if (accessibleFolders.length > 0 && keywords.length > 0) {
+      const matchedFolders = accessibleFolders.filter(f =>
+        matchesKeywords(f.name, keywords) ||
+        matchesKeywords(f.description, keywords) ||
+        matchesKeywords(JSON.stringify(f.facts || []), keywords)
+      );
+      if (matchedFolders.length > 0) {
+        results.push("=== ARCHIVES (Compiled Dossiers) ===\n" + JSON.stringify(matchedFolders.map(f => ({
+          name: f.name,
+          type: f.type,
+          archive: f.scope === "private" ? `${f.owner}'s Archive` : "Archives",
+          description: f.description,
+          facts: f.facts,
+          lastUpdated: formatTime(f.updatedAt)
+        })), null, 2));
+      }
+    }
+
+    // Check Raw Files (like backend.js.md) only when explicitly named in query!
+    if (rawFiles.length > 0 && keywords.length > 0) {
+      const qLower = query.toLowerCase();
+      for (const rf of rawFiles) {
+        const fullLower = rf.cleanName.toLowerCase();
+        const stemLower = fullLower.replace(/\.[a-z0-9]+$/i, "");
+        if (qLower.includes(fullLower) || (stemLower.length >= 4 && qLower.includes(stemLower))) {
+          const lines = rf.content.split(/\r?\n/);
+          const extraKws = keywords.filter(k => k !== fullLower && k !== stemLower && !rf.filename.toLowerCase().includes(k));
+          const matchedLineNums = [];
+          const numberedLines = lines.map((lineText, idx) => {
+            const lineNum = idx + 1;
+            if (extraKws.length > 0 && extraKws.some(k => lineText.toLowerCase().includes(k))) {
+              matchedLineNums.push(lineNum);
+            }
+            return `${lineNum}: ${lineText}`;
+          });
+          const matchHeader = matchedLineNums.length > 0
+            ? `[Keyword matches (${extraKws.join(", ")}) on lines: ${matchedLineNums.slice(0, 80).join(", ")}]\n`
+            : "";
+          results.push(`=== RAW ARCHIVE FILE: ${rf.filename} (${lines.length} lines) ===\n${matchHeader}${numberedLines.join("\n")}`);
+        }
+      }
+    }
 
     if (chatId && spindle.memories?.entities?.list && keywords.length > 0) {
       const localEntities = await spindle.memories.entities.list(chatId, {
@@ -1457,232 +1642,232 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       }
     }
 
-  for (const v of vaultsToSearch) {
-   if (keywords.length === 0) break;
-   const fullVault = await spindle.memories.vaults.get(v.id, userId);
-   const vaultTime = formatTime(fullVault?.created_at || fullVault?.createdAt || v.created_at || v.createdAt);
-   const vaultLabel = vaultTime ? `${v.name} | Snapshot: ${vaultTime}` : v.name;
-   const vaultNameMatched = matchesKeywords(v.name, keywords);
-   const isExplicitlyAttached = attachedVaults.some(av => av.id === v.id);
+    for (const v of vaultsToSearch) {
+      if (keywords.length === 0) break;
+      const fullVault = await spindle.memories.vaults.get(v.id, userId);
+      const vaultTime = formatTime(fullVault?.created_at || fullVault?.createdAt || v.created_at || v.createdAt);
+      const vaultLabel = vaultTime ? `${v.name} | Snapshot: ${vaultTime}` : v.name;
+      const vaultNameMatched = matchesKeywords(v.name, keywords);
+      const isExplicitlyAttached = attachedVaults.some(av => av.id === v.id);
 
-   const matchedEntities = (fullVault?.entities || [])
-    .filter(isUsefulEntity)
-    .filter(e => matchesKeywords(e.name, keywords) || matchesKeywords(JSON.stringify(e.facts || []), keywords) || matchesKeywords(e.description, keywords))
-    .map(cleanEntity);
+      const matchedEntities = (fullVault?.entities || [])
+        .filter(isUsefulEntity)
+        .filter(e => matchesKeywords(e.name, keywords) || matchesKeywords(JSON.stringify(e.facts || []), keywords) || matchesKeywords(e.description, keywords))
+        .map(cleanEntity);
 
-   if (matchedEntities.length > 0) {
-    results.push(`=== VAULT ENTITIES (${vaultLabel}) ===\n` + JSON.stringify(matchedEntities, null, 2));
-   }
-
-   if (spindle.memories.vaults.getChunks) {
-    const rawChunks = await spindle.memories.vaults.getChunks(v.id, userId);
-    const chunks = (rawChunks || []).map((c, idx) => ({ ...c, _arrIdx: idx }));
-
-    const scoredChunks = chunks
-     .map(c => ({ c, score: countKeywordMatches(c.content || c.text, keywords) }))
-     .filter(item => item.score > 0)
-     .sort((a, b) => b.score - a.score)
-     .slice(0, 5)
-     .map(item => item.c);
-
-    if ((scoredChunks.length > 0 || vaultNameMatched || matchedEntities.length > 0) && chunks.length > 0) {
-     const combinedChunks = [...scoredChunks];
-
-     // Only append the latest 2 chunks if this Vault's name was searched OR it is explicitly attached to this chat!
-     if (vaultNameMatched || isExplicitlyAttached) {
-      const chronological = [...chunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
-      const recentTail = chronological.slice(-2).map(c => ({ ...c, _latestTag: "LATEST IN VAULT" }));
-      for (const tailItem of recentTail) {
-       const tKey = tailItem.id || tailItem.chunk_id || tailItem._arrIdx;
-       const existing = combinedChunks.find(x => (x.id || x.chunk_id || x._arrIdx) === tKey);
-       if (existing) {
-        existing._latestTag = "LATEST IN VAULT";
-       } else {
-        combinedChunks.push(tailItem);
-       }
+      if (matchedEntities.length > 0) {
+        results.push(`=== VAULT ENTITIES (${vaultLabel}) ===\n` + JSON.stringify(matchedEntities, null, 2));
       }
-     }
 
-     if (combinedChunks.length > 0) {
-      const formattedChunks = formatAndSortChunks(combinedChunks);
-      results.push(`=== VAULT CHAT CHUNKS (${vaultLabel} | Total Chunks: ${chunks.length}) ===\n` + formattedChunks.join("\n---\n"));
-     }
-    }
-   }
-  }
+      if (spindle.memories.vaults.getChunks) {
+        const rawChunks = await spindle.memories.vaults.getChunks(v.id, userId);
+        const chunks = (rawChunks || []).map((c, idx) => ({ ...c, _arrIdx: idx }));
 
-  for (const linkedChatId of interlinkedChatIds) {
-   if (keywords.length === 0) break;
-   if (spindle.memories?.entities?.list) {
-    const linkedEntities = await spindle.memories.entities.list(linkedChatId, {
-     activeOnly: false,
-     userId
-    });
-    const matchedEntities = (linkedEntities || [])
-     .filter(isUsefulEntity)
-     .filter(e => matchesKeywords(e.name, keywords) || matchesKeywords(JSON.stringify(e.facts || []), keywords) || matchesKeywords(e.description, keywords))
-     .map(cleanEntity);
+        const scoredChunks = chunks
+          .map(c => ({ c, score: countKeywordMatches(c.content || c.text, keywords) }))
+          .filter(item => item.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 5)
+          .map(item => item.c);
 
-    if (matchedEntities.length > 0) {
-     results.push(`=== INTERLINKED CHAT ENTITIES (Chat: ${linkedChatId}) ===\n` + JSON.stringify(matchedEntities, null, 2));
-    }
-   }
+        if ((scoredChunks.length > 0 || vaultNameMatched || matchedEntities.length > 0) && chunks.length > 0) {
+          const combinedChunks = [...scoredChunks];
 
-   let chatMessages = [];
-   if (spindle.chat?.getMessages) {
-    try {
-     const rawMsgs = await spindle.chat.getMessages(linkedChatId, userId);
-     chatMessages = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
-    } catch (err) {
-     console.warn("spindle.chat.getMessages failed:", err.message);
-    }
-   }
+          // Only append the latest 2 chunks if this Vault's name was searched OR it is explicitly attached to this chat!
+          if (vaultNameMatched || isExplicitlyAttached) {
+            const chronological = [...chunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
+            const recentTail = chronological.slice(-2).map(c => ({ ...c, _latestTag: "LATEST IN VAULT" }));
+            for (const tailItem of recentTail) {
+              const tKey = tailItem.id || tailItem.chunk_id || tailItem._arrIdx;
+              const existing = combinedChunks.find(x => (x.id || x.chunk_id || x._arrIdx) === tKey);
+              if (existing) {
+                existing._latestTag = "LATEST IN VAULT";
+              } else {
+                combinedChunks.push(tailItem);
+              }
+            }
+          }
 
-   if (chatMessages.length > 0) {
-    const scoredMsgs = [];
-    const isImgQuery = /\b(screenshot|screenshots|image|images|pic|pics|picture|pictures|photo|attachment|attachments|shown|screen|hud)\b/i.test(query);
-
-    const buildMsgEntry = (m, idx, scoreVal, isLatestTail = false) => {
-     const msgTime = formatTime(getMsgTimestamp(m)) || "";
-     const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
-     const attTag = formatAttachmentTags(m);
-     const hasAtt = Boolean(attTag);
-     const followUps = [];
-
-     if (hasAtt) {
-      for (let offset = 1; offset <= 3; offset++) {
-       const fMsg = chatMessages[idx + offset];
-       if (!fMsg) break;
-       const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
-       const fTime = formatTime(getMsgTimestamp(fMsg)) || "";
-       const fText = typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || "");
-       followUps.push({ msgIdx: idx + offset, role: fRole, time: fTime, text: fText });
-       if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
-      }
-     }
-
-     const role = m.role || m.name || (m.is_user ? "User" : "Assistant");
-     const latestPrefix = isLatestTail ? "LATEST | " : "";
-     let formatted = `[${latestPrefix}Message #${idx} | Time: ${msgTime} | ${role}]${attTag ? ` ${attTag}` : ""}\n${msgText}`;
-
-     for (const f of followUps) {
-      formatted += `\n ↳ [Paired #${f.msgIdx} | Time: ${f.time} | ${f.role}]\n${f.text}`;
-     }
-
-     return {
-      idx,
-      score: scoreVal,
-      formatted,
-      attIds: extractAttachmentIds(m),
-      rawText: msgText
-     };
-    };
-
-    chatMessages.forEach((m, idx) => {
-     const msgTime = formatTime(getMsgTimestamp(m)) || "";
-     const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
-     const attTag = formatAttachmentTags(m);
-     const hasAtt = Boolean(attTag);
-
-     let followUpTextCombined = "";
-     if (hasAtt) {
-      for (let offset = 1; offset <= 3; offset++) {
-       const fMsg = chatMessages[idx + offset];
-       if (!fMsg) break;
-       const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
-       followUpTextCombined += " " + (typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || ""));
-       if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
-      }
-     }
-
-     const combined = `${msgTime} ${attTag} ${msgText} ${followUpTextCombined}`;
-     let score = countKeywordMatches(combined, keywords);
-     if (isImgQuery && hasAtt) score += keywords.length + 2;
-
-     const minRequired = hasAtt ? 1 : (keywords.length <= 4 ? Math.max(1, keywords.length - 1) : Math.max(2, keywords.length - 2));
-
-     if (score >= minRequired) {
-      scoredMsgs.push(buildMsgEntry(m, idx, score, false));
-     }
-    });
-
-    // ONLY include results (and the last 2 messages) if this Interlinked chat actually matched the search!
-    if (scoredMsgs.length > 0) {
-     scoredMsgs.sort((a, b) => b.score - a.score || a.idx - b.idx);
-     const topItems = scoredMsgs.slice(0, 5);
-
-     const tailStart = Math.max(0, chatMessages.length - 2);
-     for (let tIdx = tailStart; tIdx < chatMessages.length; tIdx++) {
-      if (!topItems.some(item => item.idx === tIdx)) {
-       topItems.push(buildMsgEntry(chatMessages[tIdx], tIdx, 0, true));
-      }
-     }
-     topItems.sort((a, b) => a.idx - b.idx);
-
-     const visionCache = await getVisionCacheMap(userId);
-     let liveScansUsed = 0;
-     const topMsgs = [];
-
-     for (const item of topItems) {
-      let block = item.formatted;
-      for (const imgId of (item.attIds || [])) {
-       if (visionCache[imgId]) {
-        block += `\n [Cached Vision OCR (${imgId})]:\n${visionCache[imgId]}`;
-       } else if (liveScansUsed < 1 && (isImgQuery || query.toLowerCase().includes(imgId.toLowerCase()))) {
-        liveScansUsed++;
-        const liveDesc = await analyzeImageById(imgId, userId, item.rawText, query);
-        if (liveDesc) {
-         block += `\n [Live Vision OCR (${imgId})]:\n${liveDesc}`;
+          if (combinedChunks.length > 0) {
+            const formattedChunks = formatAndSortChunks(combinedChunks);
+            results.push(`=== VAULT CHAT CHUNKS (${vaultLabel} | Total Chunks: ${chunks.length}) ===\n` + formattedChunks.join("\n---\n"));
+          }
         }
-       }
       }
-      topMsgs.push(block);
-     }
-
-     results.push(`=== INTERLINKED MESSAGES (Chat: ${linkedChatId} | Total: ${chatMessages.length}) ===\n` + topMsgs.join("\n---\n"));
     }
-   }
 
-   if (spindle.memories?.chatMemory?.listChunks) {
-    const rawChunks = await spindle.memories.chatMemory.listChunks(linkedChatId, userId);
-    const chatChunks = (Array.isArray(rawChunks) ? rawChunks : (rawChunks?.chunks || [])).map((c, idx) => ({ ...c, _arrIdx: idx }));
-    const enrichedChunks = chatChunks.map(c => {
-     const startIdx = getChunkStartIdx(c) ?? c.start_index ?? c.start_message_index;
-     const realMsg = (startIdx !== undefined && chatMessages[startIdx]) ? chatMessages[startIdx] : null;
-     const realTime = getMsgTimestamp(realMsg);
-     return realTime ? { ...c, timestamp: realTime } : c;
-    });
+    for (const linkedChatId of interlinkedChatIds) {
+      if (keywords.length === 0) break;
+      if (spindle.memories?.entities?.list) {
+        const linkedEntities = await spindle.memories.entities.list(linkedChatId, {
+          activeOnly: false,
+          userId
+        });
+        const matchedEntities = (linkedEntities || [])
+          .filter(isUsefulEntity)
+          .filter(e => matchesKeywords(e.name, keywords) || matchesKeywords(JSON.stringify(e.facts || []), keywords) || matchesKeywords(e.description, keywords))
+          .map(cleanEntity);
 
-    const matchedChunks = enrichedChunks
-     .map(c => {
-      const timeStr = formatTime(c.timestamp || c.timeRange || c.created_at || c.createdAt || c.updatedAt) || "";
-      const score = countKeywordMatches(`${timeStr} ${c.content || c.text || ""}`, keywords);
-      return { c, score };
-     })
-     .filter(item => item.score > 0)
-     .sort((a, b) => b.score - a.score)
-     .slice(0, 5)
-     .map(item => item.c);
+        if (matchedEntities.length > 0) {
+          results.push(`=== INTERLINKED CHAT ENTITIES (Chat: ${linkedChatId}) ===\n` + JSON.stringify(matchedEntities, null, 2));
+        }
+      }
 
-    // ONLY append the final 1 chunk if this Interlinked chat already had matching chunks!
-    if (matchedChunks.length > 0 && enrichedChunks.length > 0) {
-     const chronological = [...enrichedChunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
-     const tailChunk = chronological[chronological.length - 1];
-     if (tailChunk && !matchedChunks.some(mc => (mc.id || mc._arrIdx) === (tailChunk.id || tailChunk._arrIdx))) {
-      matchedChunks.push({ ...tailChunk, _latestTag: "LATEST CHUNK" });
-     }
-     const formattedChunks = formatAndSortChunks(matchedChunks);
-     results.push(`=== INTERLINKED CHAT CHUNKS (Chat: ${linkedChatId}) ===\n` + formattedChunks.join("\n---\n"));
+      let chatMessages = [];
+      if (spindle.chat?.getMessages) {
+        try {
+          const rawMsgs = await spindle.chat.getMessages(linkedChatId, userId);
+          chatMessages = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
+        } catch (err) {
+          console.warn("spindle.chat.getMessages failed:", err.message);
+        }
+      }
+
+      if (chatMessages.length > 0) {
+        const scoredMsgs = [];
+        const isImgQuery = /\b(screenshot|screenshots|image|images|pic|pics|picture|pictures|photo|attachment|attachments|shown|screen|hud)\b/i.test(query);
+
+        const buildMsgEntry = (m, idx, scoreVal, isLatestTail = false) => {
+          const msgTime = formatTime(getMsgTimestamp(m)) || "";
+          const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
+          const attTag = formatAttachmentTags(m);
+          const hasAtt = Boolean(attTag);
+          const followUps = [];
+
+          if (hasAtt) {
+            for (let offset = 1; offset <= 3; offset++) {
+              const fMsg = chatMessages[idx + offset];
+              if (!fMsg) break;
+              const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
+              const fTime = formatTime(getMsgTimestamp(fMsg)) || "";
+              const fText = typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || "");
+              followUps.push({ msgIdx: idx + offset, role: fRole, time: fTime, text: fText });
+              if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
+            }
+          }
+
+          const role = m.role || m.name || (m.is_user ? "User" : "Assistant");
+          const latestPrefix = isLatestTail ? "LATEST | " : "";
+          let formatted = `[${latestPrefix}Message #${idx} | Time: ${msgTime} | ${role}]${attTag ? ` ${attTag}` : ""}\n${msgText}`;
+
+          for (const f of followUps) {
+            formatted += `\n ↳ [Paired #${f.msgIdx} | Time: ${f.time} | ${f.role}]\n${f.text}`;
+          }
+
+          return {
+            idx,
+            score: scoreVal,
+            formatted,
+            attIds: extractAttachmentIds(m),
+            rawText: msgText
+          };
+        };
+
+        chatMessages.forEach((m, idx) => {
+          const msgTime = formatTime(getMsgTimestamp(m)) || "";
+          const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
+          const attTag = formatAttachmentTags(m);
+          const hasAtt = Boolean(attTag);
+
+          let followUpTextCombined = "";
+          if (hasAtt) {
+            for (let offset = 1; offset <= 3; offset++) {
+              const fMsg = chatMessages[idx + offset];
+              if (!fMsg) break;
+              const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
+              followUpTextCombined += " " + (typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || ""));
+              if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
+            }
+          }
+
+          const combined = `${msgTime} ${attTag} ${msgText} ${followUpTextCombined}`;
+          let score = countKeywordMatches(combined, keywords);
+          if (isImgQuery && hasAtt) score += keywords.length + 2;
+
+          const minRequired = hasAtt ? 1 : (keywords.length <= 4 ? Math.max(1, keywords.length - 1) : Math.max(2, keywords.length - 2));
+
+          if (score >= minRequired) {
+            scoredMsgs.push(buildMsgEntry(m, idx, score, false));
+          }
+        });
+
+        // ONLY include results (and the last 2 messages) if this Interlinked chat actually matched the search!
+        if (scoredMsgs.length > 0) {
+          scoredMsgs.sort((a, b) => b.score - a.score || a.idx - b.idx);
+          const topItems = scoredMsgs.slice(0, 5);
+
+          const tailStart = Math.max(0, chatMessages.length - 2);
+          for (let tIdx = tailStart; tIdx < chatMessages.length; tIdx++) {
+            if (!topItems.some(item => item.idx === tIdx)) {
+              topItems.push(buildMsgEntry(chatMessages[tIdx], tIdx, 0, true));
+            }
+          }
+          topItems.sort((a, b) => a.idx - b.idx);
+
+          const visionCache = await getVisionCacheMap(userId);
+          let liveScansUsed = 0;
+          const topMsgs = [];
+
+          for (const item of topItems) {
+            let block = item.formatted;
+            for (const imgId of (item.attIds || [])) {
+              if (visionCache[imgId]) {
+                block += `\n [Cached Vision OCR (${imgId})]:\n${visionCache[imgId]}`;
+              } else if (liveScansUsed < 1 && (isImgQuery || query.toLowerCase().includes(imgId.toLowerCase()))) {
+                liveScansUsed++;
+                const liveDesc = await analyzeImageById(imgId, userId, item.rawText, query);
+                if (liveDesc) {
+                  block += `\n [Live Vision OCR (${imgId})]:\n${liveDesc}`;
+                }
+              }
+            }
+            topMsgs.push(block);
+          }
+
+          results.push(`=== INTERLINKED MESSAGES (Chat: ${linkedChatId} | Total: ${chatMessages.length}) ===\n` + topMsgs.join("\n---\n"));
+        }
+      }
+
+      if (spindle.memories?.chatMemory?.listChunks) {
+        const rawChunks = await spindle.memories.chatMemory.listChunks(linkedChatId, userId);
+        const chatChunks = (Array.isArray(rawChunks) ? rawChunks : (rawChunks?.chunks || [])).map((c, idx) => ({ ...c, _arrIdx: idx }));
+        const enrichedChunks = chatChunks.map(c => {
+          const startIdx = getChunkStartIdx(c) ?? c.start_index ?? c.start_message_index;
+          const realMsg = (startIdx !== undefined && chatMessages[startIdx]) ? chatMessages[startIdx] : null;
+          const realTime = getMsgTimestamp(realMsg);
+          return realTime ? { ...c, timestamp: realTime } : c;
+        });
+
+        const matchedChunks = enrichedChunks
+          .map(c => {
+            const timeStr = formatTime(c.timestamp || c.timeRange || c.created_at || c.createdAt || c.updatedAt) || "";
+            const score = countKeywordMatches(`${timeStr} ${c.content || c.text || ""}`, keywords);
+            return { c, score };
+          })
+          .filter(item => item.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 5)
+          .map(item => item.c);
+
+        // ONLY append the final 1 chunk if this Interlinked chat already had matching chunks!
+        if (matchedChunks.length > 0 && enrichedChunks.length > 0) {
+          const chronological = [...enrichedChunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
+          const tailChunk = chronological[chronological.length - 1];
+          if (tailChunk && !matchedChunks.some(mc => (mc.id || mc._arrIdx) === (tailChunk.id || tailChunk._arrIdx))) {
+            matchedChunks.push({ ...tailChunk, _latestTag: "LATEST CHUNK" });
+          }
+          const formattedChunks = formatAndSortChunks(matchedChunks);
+          results.push(`=== INTERLINKED CHAT CHUNKS (Chat: ${linkedChatId}) ===\n` + formattedChunks.join("\n---\n"));
+        }
+      }
     }
-   }
-  }
 
-  if (results.length <= 1) {
-   return `${results[0]}\nNo matching memories found for "${query}".`;
+    if (results.length <= 1) {
+      return `${results[0]}\nNo matching memories found for "${query}".`;
+    }
+    return results.join("\n\n");
+  } catch (error) {
+    console.error("Memory recall error:", error);
+    return "Memory search encountered an error: " + error.message;
   }
-  return results.join("\n\n");
- } catch (error) {
-  console.error("Memory recall error:", error);
-  return "Memory search encountered an error: " + error.message;
- }
 });
