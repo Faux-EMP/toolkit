@@ -1359,21 +1359,43 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     if (spindle.generate?.quiet) {
       let nativeResult = null;
       let targetConnId = payload?.connectionId || payload?.connection_id || cachedConnectionId;
+      let activeModel = "";
 
-      if (spindle.connections?.list) {
+      try {
+        const activeChatId = await getActiveChatId(payload.chatId || payload.chat_id, userId);
+        if (activeChatId && spindle.chat?.getMessages) {
+          const msgsRaw = await spindle.chat.getMessages(activeChatId, { limit: 10, userId }, userId);
+          const msgs = Array.isArray(msgsRaw) ? msgsRaw : (msgsRaw?.messages || msgsRaw?.data || []);
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i]?.extra?.generationMetrics?.model || msgs[i]?.extra?.model || "";
+            if (m) {
+              activeModel = String(m).toLowerCase();
+              break;
+            }
+          }
+        }
+      } catch (_) { }
+
+      const activeChatIsNonMain = activeModel && (
+        activeModel.includes("glm") ||
+        activeModel.includes("kimi") ||
+        activeModel.includes("moonshot")
+      );
+
+      if (!activeChatIsNonMain && spindle.connections?.list) {
         try {
-          const connsRaw = await spindle.connections.list(userId);
+          let connsRaw = null;
+          try {
+            connsRaw = await spindle.connections.list({ userId }, userId);
+          } catch (_) {
+            connsRaw = await spindle.connections.list(userId);
+          }
           const list = Array.isArray(connsRaw) ? connsRaw : (connsRaw?.connections || connsRaw?.data || []);
           const chatConns = list.filter(c => !/embed/i.test(c?.name || "") && !/embed/i.test(c?.model || ""));
 
-          // Resolve the active/default connection when targetConnId isn't passed in event payloads
-          const activeConn = (targetConnId && chatConns.find(c => (c.id || c.connectionId || c.connection_id) === targetConnId))
-            || chatConns.find(c => c.is_default || c.isDefault || c.active || c.is_active)
-            || chatConns[0];
-
-          if (activeConn) {
-            const blob = JSON.stringify(activeConn).toLowerCase();
-            const isNonMain = blob.includes("glm")
+          const isNonMainConn = (c) => {
+            const blob = JSON.stringify(c || {}).toLowerCase();
+            return blob.includes("glm")
               || blob.includes("kimi")
               || blob.includes("moonshot")
               || blob.includes("127.0.0.1")
@@ -1381,13 +1403,22 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
               || blob.includes("localhost")
               || blob.includes(":8085")
               || blob.includes(":8787");
+          };
 
-            targetConnId = isNonMain ? null : (activeConn.id || activeConn.connectionId || activeConn.connection_id || null);
+          // 1. Match the exact model active in this chat, or 2. Pick the first Main Proxy connection
+          const matchedConn = (activeModel && chatConns.find(c => String(c.model || "").toLowerCase() === activeModel))
+            || (targetConnId && chatConns.find(c => (c.id || c.connectionId || c.connection_id) === targetConnId && !isNonMainConn(c)))
+            || chatConns.find(c => !isNonMainConn(c));
+
+          if (matchedConn) {
+            targetConnId = matchedConn.id || matchedConn.connectionId || matchedConn.connection_id || null;
           }
-        } catch (_) { }
+        } catch (e) {
+          lastSearchErr = `Connection lookup error: ${e.message}`;
+        }
       }
 
-      if (targetConnId) {
+      if (!activeChatIsNonMain && targetConnId) {
         // 2000ms buffer BEFORE calling Main Proxy so active stream slot settles
         await new Promise(r => setTimeout(r, 2000));
         try {
@@ -1410,10 +1441,10 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
             ]
           };
 
-          console.log(`=== WEB SEARCH ROUTING VIA MAIN PROXY (${targetConnId}) ===`);
+          console.log(`=== WEB SEARCH ROUTING VIA MAIN PROXY (${targetConnId} | model: ${activeModel || "default"}) ===`);
           const res = await Promise.race([
             spindle.generate.quiet(quietReq, userId),
-            new Promise((_, rej) => setTimeout(() => rej(new Error("Quiet native search timed out after 20s")), 20000))
+            new Promise((_, rej) => setTimeout(() => rej(new Error("Quiet native search timed out after 25s")), 25000))
           ]);
           const text = typeof res === "string"
             ? res
@@ -1432,8 +1463,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
           await new Promise(r => setTimeout(r, 2000));
         }
       } else {
-        lastSearchErr = "Skipped native search (active connection is non-Main proxy).";
-        console.log("=== WEB SEARCH: Non-Main proxy active, jumping straight to SearXNG ===");
+        lastSearchErr = `Skipped native search (activeModel=${activeModel || "unknown"}, targetConnId=${targetConnId || "none"}).`;
       }
 
       if (nativeResult) return nativeResult;
