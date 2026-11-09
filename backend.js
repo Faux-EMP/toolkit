@@ -1628,8 +1628,8 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
     const MAX_CHUNKS_PER_VAULT = 2;
     const MAX_GLOBAL_VAULT_CHUNKS = 6;
-    const MAX_CHUNK_CHARS = 1500;
-    const MAX_TOTAL_VAULT_CHARS = 9000;
+    const MAX_CHUNK_CHARS = 2500;
+    const MAX_TOTAL_VAULT_CHARS = 12000;
 
     const vaultCandidates = [];
     let entitySectionsAdded = 0;
@@ -1707,6 +1707,33 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     }
 
     if (vaultCandidates.length > 0) {
+      const cleanVaultChunkText = (text) => {
+        // 1. Collapse complete fenced code blocks longer than 300 chars
+        let cleaned = text.replace(/```([^\n]*)\n([\s\S]*?)```/g, (match, lang, body) => {
+          if (body.length <= 300) return match;
+          const preview = body.split(/\r?\n/).slice(0, 2).join("\n");
+          return `\`\`\`${lang}\n${preview}\n...[code block omitted to save tokens]...\n\`\`\``;
+        });
+
+        // 2. Catch unclosed code blocks (when a chunk splits mid-codeblock)
+        const fenceCount = (cleaned.match(/```/g) || []).length;
+        if (fenceCount % 2 === 1) {
+          const lastFenceIdx = cleaned.lastIndexOf("```");
+          if (cleaned.length - lastFenceIdx > 350) {
+            const tailSlice = cleaned.slice(lastFenceIdx, lastFenceIdx + 160);
+            cleaned = `${cleaned.slice(0, lastFenceIdx)}${tailSlice}\n...[unclosed code block omitted to save tokens]...`;
+          }
+        }
+
+        // 3. If still over MAX_CHUNK_CHARS, keep head (1500) + tail (900) so bottom replies aren't lost
+        if (cleaned.length > MAX_CHUNK_CHARS) {
+          const head = cleaned.slice(0, 1500);
+          const tail = cleaned.slice(-900);
+          cleaned = `${head}\n...[middle of chunk truncated to save tokens]...\n${tail}`;
+        }
+        return cleaned;
+      };
+
       vaultCandidates.sort((a, b) => b.totalScore - a.totalScore || a.vaultOrder - b.vaultOrder);
       const selectedGlobal = vaultCandidates.slice(0, MAX_GLOBAL_VAULT_CHUNKS);
 
@@ -1716,9 +1743,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       for (const item of selectedGlobal) {
         if (totalCharsUsed >= MAX_TOTAL_VAULT_CHARS) break;
         const rawText = String(item.chunk.content || item.chunk.text || "");
-        const clippedText = rawText.length > MAX_CHUNK_CHARS
-          ? `${rawText.slice(0, MAX_CHUNK_CHARS)}\n...[chunk truncated to save tokens]`
-          : rawText;
+        const clippedText = cleanVaultChunkText(rawText);
 
         const remainingBudget = MAX_TOTAL_VAULT_CHARS - totalCharsUsed;
         if (remainingBudget < 200) break;
