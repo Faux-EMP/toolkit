@@ -1575,6 +1575,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     }
 
     // Check Raw Files (like backend.js.md) only when explicitly named in query!
+    let onlyQueriedRawFile = false;
     if (rawFiles.length > 0 && keywords.length > 0) {
       const qLower = query.toLowerCase();
       for (const rf of rawFiles) {
@@ -1583,6 +1584,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
         if (qLower.includes(fullLower) || (stemLower.length >= 4 && qLower.includes(stemLower))) {
           const lines = rf.content.split(/\r?\n/);
           const extraKws = keywords.filter(k => k !== fullLower && k !== stemLower && !rf.filename.toLowerCase().includes(k));
+          if (extraKws.length === 0) onlyQueriedRawFile = true;
           const matchedLineNums = [];
           const numberedLines = lines.map((lineText, idx) => {
             const lineNum = idx + 1;
@@ -1614,57 +1616,132 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       }
     }
 
-    for (const v of vaultsToSearch) {
-      if (keywords.length === 0) break;
-      const fullVault = await spindle.memories.vaults.get(v.id, userId);
-      const vaultTime = formatTime(fullVault?.created_at || fullVault?.createdAt || v.created_at || v.createdAt);
-      const vaultLabel = vaultTime ? `${v.name} | Snapshot: ${vaultTime}` : v.name;
-      const vaultNameMatched = matchesKeywords(v.name, keywords);
-      const isExplicitlyAttached = attachedVaults.some(av => av.id === v.id);
+    // Global Top-K & Token-Budgeted Vault Search
+    const STOP_WORDS = new Set([
+      "the", "and", "for", "with", "that", "this", "from", "what", "when", "where",
+      "which", "who", "how", "why", "did", "was", "were", "are", "have", "has", "had",
+      "not", "but", "you", "your", "our", "can", "will", "just", "like", "about", "into",
+      "chat", "vault", "vaults", "memory", "memories", "js", "py", "md"
+    ]);
+    const vaultKeywords = keywords.filter(k => k.length >= 2 && !STOP_WORDS.has(k));
+    const activeVaultKws = vaultKeywords.length > 0 ? vaultKeywords : keywords;
 
-      const matchedEntities = (fullVault?.entities || [])
-        .filter(isUsefulEntity)
-        .filter(e => matchesKeywords(e.name, keywords) || matchesKeywords(JSON.stringify(e.facts || []), keywords) || matchesKeywords(e.description, keywords))
-        .map(cleanEntity);
+    const MAX_CHUNKS_PER_VAULT = 2;
+    const MAX_GLOBAL_VAULT_CHUNKS = 6;
+    const MAX_CHUNK_CHARS = 1500;
+    const MAX_TOTAL_VAULT_CHARS = 9000;
 
-      if (matchedEntities.length > 0) {
-        results.push(`=== VAULT ENTITIES (${vaultLabel}) ===\n` + JSON.stringify(matchedEntities, null, 2));
-      }
+    const vaultCandidates = [];
+    let entitySectionsAdded = 0;
 
-      if (spindle.memories.vaults.getChunks) {
-        const rawChunks = await spindle.memories.vaults.getChunks(v.id, userId);
-        const chunks = (rawChunks || []).map((c, idx) => ({ ...c, _arrIdx: idx }));
+    if (!onlyQueriedRawFile && activeVaultKws.length > 0) {
+      for (let vIdx = 0; vIdx < vaultsToSearch.length; vIdx++) {
+        const v = vaultsToSearch[vIdx];
+        const fullVault = await spindle.memories.vaults.get(v.id, userId);
+        const vaultTime = formatTime(fullVault?.created_at || fullVault?.createdAt || v.created_at || v.createdAt);
+        const vaultLabel = vaultTime ? `${v.name} | Snapshot: ${vaultTime}` : v.name;
+        const vaultNameMatched = matchesKeywords(v.name, activeVaultKws);
+        const isExplicitlyAttached = attachedVaults.some(av => av.id === v.id);
 
-        const scoredChunks = chunks
-          .map(c => ({ c, score: countKeywordMatches(c.content || c.text, keywords) }))
-          .filter(item => item.score > 0)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 5)
-          .map(item => item.c);
+        if (entitySectionsAdded < 2) {
+          const matchedEntities = (fullVault?.entities || [])
+            .filter(isUsefulEntity)
+            .filter(e => matchesKeywords(e.name, activeVaultKws) || matchesKeywords(JSON.stringify(e.facts || []), activeVaultKws) || matchesKeywords(e.description, activeVaultKws))
+            .slice(0, 4)
+            .map(cleanEntity);
 
-        if ((scoredChunks.length > 0 || vaultNameMatched || matchedEntities.length > 0) && chunks.length > 0) {
-          const combinedChunks = [...scoredChunks];
+          if (matchedEntities.length > 0) {
+            results.push(`=== VAULT ENTITIES (${vaultLabel}) ===\n` + JSON.stringify(matchedEntities, null, 2));
+            entitySectionsAdded++;
+          }
+        }
 
-          // Only append the latest 2 chunks if this Vault's name was searched OR it is explicitly attached to this chat!
-          if (vaultNameMatched || isExplicitlyAttached) {
+        if (spindle.memories.vaults.getChunks) {
+          const rawChunks = await spindle.memories.vaults.getChunks(v.id, userId);
+          const chunks = (rawChunks || []).map((c, idx) => ({ ...c, _arrIdx: idx }));
+          if (chunks.length === 0) continue;
+
+          const minRequiredScore = activeVaultKws.length >= 2 ? 2 : 1;
+          const scoredForVault = chunks
+            .map(c => {
+              const rawContent = String(c.content || c.text || "");
+              const kwScore = countKeywordMatches(rawContent, activeVaultKws);
+              return { c, kwScore };
+            })
+            .filter(item => item.kwScore >= minRequiredScore)
+            .sort((a, b) => b.kwScore - a.kwScore)
+            .slice(0, MAX_CHUNKS_PER_VAULT);
+
+          // Only attach the latest chunk if explicitly attached OR this is the newest matching Vault
+          if ((isExplicitlyAttached || (vaultNameMatched && vIdx === 0)) && chunks.length > 0) {
             const chronological = [...chunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
-            const recentTail = chronological.slice(-2).map(c => ({ ...c, _latestTag: "LATEST IN VAULT" }));
-            for (const tailItem of recentTail) {
-              const tKey = tailItem.id || tailItem.chunk_id || tailItem._arrIdx;
-              const existing = combinedChunks.find(x => (x.id || x.chunk_id || x._arrIdx) === tKey);
+            const latestChunk = chronological[chronological.length - 1];
+            if (latestChunk) {
+              const lKey = latestChunk.id || latestChunk.chunk_id || latestChunk._arrIdx;
+              const existing = scoredForVault.find(x => (x.c.id || x.c.chunk_id || x.c._arrIdx) === lKey);
               if (existing) {
-                existing._latestTag = "LATEST IN VAULT";
+                existing.c._latestTag = "LATEST IN VAULT";
+                existing.kwScore += 2;
               } else {
-                combinedChunks.push(tailItem);
+                scoredForVault.push({
+                  c: { ...latestChunk, _latestTag: "LATEST IN VAULT" },
+                  kwScore: minRequiredScore + 1
+                });
               }
             }
           }
 
-          if (combinedChunks.length > 0) {
-            const formattedChunks = formatAndSortChunks(combinedChunks);
-            results.push(`=== VAULT CHAT CHUNKS (${vaultLabel} | Total Chunks: ${chunks.length}) ===\n` + formattedChunks.join("\n---\n"));
+          for (const item of scoredForVault) {
+            const priorityBonus = (isExplicitlyAttached ? 3 : 0) + (vaultNameMatched ? 1 : 0);
+            vaultCandidates.push({
+              vaultId: v.id,
+              vaultLabel,
+              totalChunks: chunks.length,
+              vaultOrder: vIdx,
+              chunk: item.c,
+              totalScore: item.kwScore + priorityBonus
+            });
           }
         }
+      }
+    }
+
+    if (vaultCandidates.length > 0) {
+      vaultCandidates.sort((a, b) => b.totalScore - a.totalScore || a.vaultOrder - b.vaultOrder);
+      const selectedGlobal = vaultCandidates.slice(0, MAX_GLOBAL_VAULT_CHUNKS);
+
+      const groupedByVault = new Map();
+      let totalCharsUsed = 0;
+
+      for (const item of selectedGlobal) {
+        if (totalCharsUsed >= MAX_TOTAL_VAULT_CHARS) break;
+        const rawText = String(item.chunk.content || item.chunk.text || "");
+        const clippedText = rawText.length > MAX_CHUNK_CHARS
+          ? `${rawText.slice(0, MAX_CHUNK_CHARS)}\n...[chunk truncated to save tokens]`
+          : rawText;
+
+        const remainingBudget = MAX_TOTAL_VAULT_CHARS - totalCharsUsed;
+        if (remainingBudget < 200) break;
+        const finalText = clippedText.length > remainingBudget
+          ? `${clippedText.slice(0, remainingBudget)}\n...[vault budget reached]`
+          : clippedText;
+
+        totalCharsUsed += finalText.length;
+        const clippedChunk = { ...item.chunk, content: finalText, text: finalText };
+
+        if (!groupedByVault.has(item.vaultId)) {
+          groupedByVault.set(item.vaultId, {
+            vaultLabel: item.vaultLabel,
+            totalChunks: item.totalChunks,
+            chunks: []
+          });
+        }
+        groupedByVault.get(item.vaultId).chunks.push(clippedChunk);
+      }
+
+      for (const group of groupedByVault.values()) {
+        const formattedChunks = formatAndSortChunks(group.chunks);
+        results.push(`=== VAULT CHAT CHUNKS (${group.vaultLabel} | Total Chunks: ${group.totalChunks}) ===\n` + formattedChunks.join("\n---\n"));
       }
     }
 
