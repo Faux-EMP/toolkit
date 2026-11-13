@@ -1428,6 +1428,8 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
   if (payload.toolName !== "recall_memory") return;
 
+  await new Promise(r => setTimeout(r, 2500));
+
   const query = String(payload.args?.query || "").trim();
   const requestedMode = String(payload.args?.vault_mode || "").trim().toLowerCase();
   const folderName = String(payload.args?.folder_name || "").trim();
