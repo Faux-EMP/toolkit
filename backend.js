@@ -1428,6 +1428,10 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
   if (payload.toolName !== "recall_memory") return;
 
+  if (globalThis._lastRecallDoneAt && Date.now() - globalThis._lastRecallDoneAt < 15000) {
+    return "[TOOLKIT RPM CIRCUIT BREAKER: Only 1 recall_memory call is allowed per turn to protect the 5 RPM proxy limit. Do NOT call another tool right now—reply to User immediately with what you have.]";
+  }
+
   await new Promise(r => setTimeout(r, 2500));
 
   const query = String(payload.args?.query || "").trim();
@@ -1663,16 +1667,20 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
           const chunks = (rawChunks || []).map((c, idx) => ({ ...c, _arrIdx: idx }));
           if (chunks.length === 0) continue;
 
+          const requestedChunkNums = [...query.matchAll(/\bchunks?\s*#?(\d+)/gi)].map(m => Number(m[1]));
+          const perVaultLimit = vaultNameMatched ? 4 : MAX_CHUNKS_PER_VAULT;
           const minRequiredScore = activeVaultKws.length >= 2 ? 2 : 1;
           const scoredForVault = chunks
             .map(c => {
               const rawContent = String(c.content || c.text || "");
-              const kwScore = countKeywordMatches(rawContent, activeVaultKws);
+              const cIdx = Number(c.chunk_index ?? c.chunkIndex ?? c.index ?? c._arrIdx);
+              const chunkNumHit = vaultNameMatched && requestedChunkNums.includes(cIdx);
+              const kwScore = countKeywordMatches(rawContent, activeVaultKws) + (chunkNumHit ? 20 : 0);
               return { c, kwScore };
             })
             .filter(item => item.kwScore >= minRequiredScore)
             .sort((a, b) => b.kwScore - a.kwScore)
-            .slice(0, MAX_CHUNKS_PER_VAULT);
+            .slice(0, perVaultLimit);
 
           // Only attach the latest chunk if explicitly attached OR this is the newest matching Vault
           if ((isExplicitlyAttached || (vaultNameMatched && vIdx === 0)) && chunks.length > 0) {
@@ -1938,10 +1946,12 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       }
     }
 
+    globalThis._lastRecallDoneAt = Date.now();
+    const rpmFooter = "\n\n[TOOLKIT RPM GUARD: 1 tool call used this turn (5 RPM limit). Do NOT chain another tool call in this turn—respond to User now.]";
     if (results.length <= 1) {
-      return `${results[0]}\nNo matching memories found for "${query}".`;
+      return `${results[0]}\nNo matching memories found for "${query}".${rpmFooter}`;
     }
-    return results.join("\n\n");
+    return results.join("\n\n") + rpmFooter;
   } catch (error) {
     console.error("Memory recall error:", error);
     return "Memory search encountered an error: " + error.message;
