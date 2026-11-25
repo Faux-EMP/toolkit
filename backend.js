@@ -295,12 +295,15 @@ function cleanFactLine(line) {
 
 function parseFolderMarkdown(mdText, fallbackName = "") {
   if (!mdText || typeof mdText !== "string") return null;
-  const lines = mdText.split(/\r?\n/);
+  const dedupedText = stripChunkOverlaps(mdText);
+  const lines = dedupedText.split(/\r?\n/);
   let name = fallbackName;
   let type = null;
   let description = null;
   const facts = [];
   let inFacts = false;
+
+  const normText = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -330,9 +333,64 @@ function parseFolderMarkdown(mdText, fallbackName = "") {
         continue;
       }
     } else {
-      if (/^#+\s/.test(line)) continue;
+      if (/^#+\s/.test(line) || /^\*\*(Category|Access|Description|Last\s+Updated):\*\*/i.test(line)) continue;
+      const hasListMarker = /^(?:\d+[\.\)]|[-*•])\s+/.test(line);
       const cleaned = cleanFactLine(line);
-      if (cleaned) facts.push(cleaned);
+      if (!cleaned) continue;
+
+      const norm = normText(cleaned);
+      if (!norm) continue;
+
+      // 1. Exact duplicate anywhere in the dossier
+      if (facts.some(f => normText(f) === norm)) {
+        continue;
+      }
+
+      let handled = false;
+      const scanStart = Math.max(0, facts.length - 10);
+
+      // 2. Catch chunk-seam fragments, truncated prefixes, and overlapping splits
+      for (let j = facts.length - 1; j >= scanStart; j--) {
+        const prev = facts[j];
+        const prevNorm = normText(prev);
+
+        // Clipped suffix/fragment from the start of the next chunk
+        if (
+          (!hasListMarker && norm.length >= 4 && (prevNorm.endsWith(norm) || (norm.length >= 16 && prevNorm.includes(norm)))) ||
+          (hasListMarker && norm.length >= 20 && prevNorm.includes(norm))
+        ) {
+          handled = true;
+          break;
+        }
+
+        // Previous fact was cut off at chunk end and this line is the complete version
+        if (prevNorm.length >= 15 && cleaned.length > prev.length && (norm.startsWith(prevNorm) || (prevNorm.length >= 25 && norm.includes(prevNorm)))) {
+          facts[j] = cleaned;
+          handled = true;
+          break;
+        }
+
+        // Split across seam with overlap: suffix of prev matches prefix of unnumbered continuation
+        if (!hasListMarker && cleaned.length >= 15 && prev.length >= 15) {
+          const maxOverlap = Math.min(prev.length, cleaned.length);
+          let overlapLen = 0;
+          for (let k = maxOverlap; k >= 15; k--) {
+            if (prev.slice(-k).toLowerCase() === cleaned.slice(0, k).toLowerCase()) {
+              overlapLen = k;
+              break;
+            }
+          }
+          if (overlapLen >= 15) {
+            facts[j] = prev + cleaned.slice(overlapLen);
+            handled = true;
+            break;
+          }
+        }
+      }
+
+      if (!handled) {
+        facts.push(cleaned);
+      }
     }
   }
 
