@@ -995,93 +995,150 @@ function resolveVaultSourceChatId(vaultSummary, fullVault, allChats) {
  return bestPartial;
 }
 
-function collectMatchedChatMessages(chatMessages, query, keywords, isImgQuery, explicitUuid, imagesOnly = false) {
+const IMAGE_NOISE_WORDS = new Set([
+ "screenshot", "screenshots", "image", "images", "pic", "pics",
+ "picture", "pictures", "photo", "photos", "attachment", "attachments", "shown"
+]);
+
+function compactBridgeText(text, maxChars = 0) {
+ let cleaned = String(text || "");
+ cleaned = cleaned.replace(/```([^\n]*)\n([\s\S]*?)```/g, (match, lang, body) => {
+ if (body.length <= 250) return match;
+ const preview = body.split(/\r?\n/).slice(0, 2).join("\n");
+ return `\`\`\`${lang}\n${preview}\n...[code block omitted]...\n\`\`\``;
+ });
+ const fenceCount = (cleaned.match(/```/g) || []).length;
+ if (fenceCount % 2 === 1) {
+ const lastFenceIdx = cleaned.lastIndexOf("```");
+ if (cleaned.length - lastFenceIdx > 300) {
+ cleaned = `${cleaned.slice(0, lastFenceIdx + 120)}\n...[unclosed code block omitted]...`;
+ }
+ }
+ if (maxChars > 0 && cleaned.length > maxChars) {
+ cleaned = `${cleaned.slice(0, maxChars)}...[trimmed]`;
+ }
+ return cleaned;
+}
+
+function collectMatchedChatMessages(chatMessages, query, keywords, isImgQuery, explicitUuid, imagesOnly = false, vaultTitleMatched = false) {
  if (!Array.isArray(chatMessages) || chatMessages.length === 0) return [];
  const scoredMsgs = [];
+ const topicKws = (keywords || []).filter(k => k && !IMAGE_NOISE_WORDS.has(k));
 
  const buildMsgEntry = (m, idx, scoreVal, isLatestTail = false) => {
-  const msgTime = formatTime(getMsgTimestamp(m)) || "";
-  const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
-  const attTag = formatAttachmentTags(m);
-  const hasAtt = Boolean(attTag);
-  const followUps = [];
+ const msgTime = formatTime(getMsgTimestamp(m)) || "";
+ const rawMsgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
+ const msgText = imagesOnly ? compactBridgeText(rawMsgText, 1000) : compactBridgeText(rawMsgText, 0);
+ const attTag = formatAttachmentTags(m);
+ const hasAtt = Boolean(attTag);
+ const followUps = [];
 
-  if (hasAtt) {
-   for (let offset = 1; offset <= 3; offset++) {
-    const fMsg = chatMessages[idx + offset];
-    if (!fMsg) break;
-    const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
-    const fTime = formatTime(getMsgTimestamp(fMsg)) || "";
-    const fText = typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || "");
-    followUps.push({ msgIdx: idx + offset, role: fRole, time: fTime, text: fText });
-    if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
-   }
-  }
+ if (hasAtt) {
+ for (let offset = 1; offset <= 3; offset++) {
+ const fMsg = chatMessages[idx + offset];
+ if (!fMsg) break;
+ const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
+ const fTime = formatTime(getMsgTimestamp(fMsg)) || "";
+ const rawFText = typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || "");
+ const fText = compactBridgeText(rawFText, imagesOnly ? 600 : 1500);
+ followUps.push({ msgIdx: idx + offset, role: fRole, time: fTime, text: fText });
+ if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
+ }
+ }
 
-  const role = m.role || m.name || (m.is_user ? "User" : "Assistant");
-  const latestPrefix = isLatestTail ? "LATEST | " : "";
-  let formatted = `[${latestPrefix}Message #${idx} | Time: ${msgTime} | ${role}]${attTag ? ` ${attTag}` : ""}\n${msgText}`;
+ const role = m.role || m.name || (m.is_user ? "User" : "Assistant");
+ const latestPrefix = isLatestTail ? "LATEST | " : "";
+ let formatted = `[${latestPrefix}Message #${idx} | Time: ${msgTime} | ${role}]${attTag ? ` ${attTag}` : ""}\n${msgText}`;
 
-  for (const f of followUps) {
-   formatted += `\n ↳ [Paired #${f.msgIdx} | Time: ${f.time} | ${f.role}]\n${f.text}`;
-  }
+ for (const f of followUps) {
+ formatted += `\n ↳ [Paired #${f.msgIdx} | Time: ${f.time} | ${f.role}]\n${f.text}`;
+ }
 
-  return {
-   idx,
-   score: scoreVal,
-   timestampMs: getMsgTimestampMs(m),
-   formatted,
-   attIds: extractAttachmentIds(m),
-   rawText: msgText
-  };
+ return {
+ idx,
+ score: scoreVal,
+ timestampMs: getMsgTimestampMs(m),
+ formatted,
+ attIds: extractAttachmentIds(m),
+ rawText: msgText
+ };
  };
 
  chatMessages.forEach((m, idx) => {
-  const attTag = formatAttachmentTags(m);
-  const hasAtt = Boolean(attTag);
-  if (imagesOnly && !hasAtt) return;
+ const attTag = formatAttachmentTags(m);
+ const hasAtt = Boolean(attTag);
+ if (imagesOnly && !hasAtt) return;
 
-  const attIds = extractAttachmentIds(m);
-  const uuidHit = Boolean(explicitUuid && attIds.some(id => id.toLowerCase() === explicitUuid));
-  const msgTime = formatTime(getMsgTimestamp(m)) || "";
-  const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
+ const attIds = extractAttachmentIds(m);
+ const uuidHit = Boolean(explicitUuid && attIds.some(id => id.toLowerCase() === explicitUuid));
+ const msgTime = formatTime(getMsgTimestamp(m)) || "";
+ const msgText = compactBridgeText(
+ typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || "")),
+ 0
+ );
 
-  let followUpTextCombined = "";
-  if (hasAtt) {
-   for (let offset = 1; offset <= 3; offset++) {
-    const fMsg = chatMessages[idx + offset];
-    if (!fMsg) break;
-    const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
-    followUpTextCombined += " " + (typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || ""));
-    if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
-   }
-  }
+ let followUpTextCombined = "";
+ if (hasAtt) {
+ for (let offset = 1; offset <= 3; offset++) {
+ const fMsg = chatMessages[idx + offset];
+ if (!fMsg) break;
+ const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
+ const rawFText = typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || "");
+ followUpTextCombined += " " + compactBridgeText(rawFText, 0);
+ if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
+ }
+ }
 
-  const combined = `${msgTime} ${attTag} ${msgText} ${followUpTextCombined}`;
-  let score = countKeywordMatches(combined, keywords);
-  if (uuidHit) score += 100;
-  else if (isImgQuery && hasAtt) score += keywords.length + 2;
+ const combined = `${msgTime} ${attTag} ${msgText} ${followUpTextCombined}`;
+ const activeKws = topicKws.length > 0 ? topicKws : keywords;
+ const topicHits = countKeywordMatches(combined, activeKws);
 
-  const minRequired = (hasAtt || uuidHit) ? 1 : (keywords.length <= 4 ? Math.max(1, keywords.length - 1) : Math.max(2, keywords.length - 2));
+ let score = 0;
+ let passed = false;
 
-  if (score >= minRequired) {
-   scoredMsgs.push(buildMsgEntry(m, idx, score, false));
-  }
+ if (uuidHit) {
+ score = 100 + topicHits;
+ passed = true;
+ } else if (imagesOnly) {
+ if (topicKws.length === 0) {
+ score = 1;
+ passed = true;
+ } else if (topicHits > 0) {
+ score = topicHits * 3 + (vaultTitleMatched ? 2 : 0);
+ passed = true;
+ } else if (vaultTitleMatched) {
+ score = 1;
+ passed = true;
+ }
+ } else {
+ score = topicHits;
+ if (isImgQuery && hasAtt) {
+ score = topicHits > 0 ? (topicHits * 3 + 2) : 1;
+ passed = true;
+ } else {
+ const minRequired = hasAtt ? 1 : (activeKws.length <= 4 ? Math.max(1, activeKws.length - 1) : Math.max(2, activeKws.length - 2));
+ passed = score >= minRequired;
+ }
+ }
+
+ if (passed) {
+ scoredMsgs.push(buildMsgEntry(m, idx, score, false));
+ }
  });
 
  if (scoredMsgs.length === 0) return [];
 
  // Highest score first; NEWEST message wins ties!
  scoredMsgs.sort((a, b) => b.score - a.score || b.idx - a.idx);
- const topItems = scoredMsgs.slice(0, imagesOnly ? 4 : 5);
+ const topItems = scoredMsgs.slice(0, imagesOnly ? 3 : 5);
 
  if (!imagesOnly) {
-  const tailStart = Math.max(0, chatMessages.length - 2);
-  for (let tIdx = tailStart; tIdx < chatMessages.length; tIdx++) {
-   if (!topItems.some(item => item.idx === tIdx)) {
-    topItems.push(buildMsgEntry(chatMessages[tIdx], tIdx, 0, true));
-   }
-  }
+ const tailStart = Math.max(0, chatMessages.length - 2);
+ for (let tIdx = tailStart; tIdx < chatMessages.length; tIdx++) {
+ if (!topItems.some(item => item.idx === tIdx)) {
+ topItems.push(buildMsgEntry(chatMessages[tIdx], tIdx, 0, true));
+ }
+ }
  }
 
  topItems.sort((a, b) => a.idx - b.idx);
@@ -1824,12 +1881,14 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
 
     // Check Raw Files (like backend.js.md) only when explicitly named in query!
     let onlyQueriedRawFile = false;
+    let matchedRawFile = false;
     if (rawFiles.length > 0 && keywords.length > 0) {
       const qLower = query.toLowerCase();
       for (const rf of rawFiles) {
         const fullLower = rf.cleanName.toLowerCase();
         const stemLower = fullLower.replace(/\.[a-z0-9]+$/i, "");
         if (qLower.includes(fullLower) || (stemLower.length >= 4 && qLower.includes(stemLower))) {
+          matchedRawFile = true;
           const lines = rf.content.split(/\r?\n/);
           const extraKws = keywords.filter(k => k !== fullLower && k !== stemLower && !rf.filename.toLowerCase().includes(k));
           if (extraKws.length === 0) onlyQueriedRawFile = true;
@@ -1869,7 +1928,9 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       "the", "and", "for", "with", "that", "this", "from", "what", "when", "where",
       "which", "who", "how", "why", "did", "was", "were", "are", "have", "has", "had",
       "not", "but", "you", "your", "our", "can", "will", "just", "like", "about", "into",
-      "chat", "vault", "vaults", "memory", "memories", "js", "py", "md"
+      "chat", "vault", "vaults", "memory", "memories", "js", "py", "md",
+      "screenshot", "screenshots", "image", "images", "pic", "pics",
+      "picture", "pictures", "photo", "photos", "attachment", "attachments", "shown"
     ]);
     const vaultKeywords = keywords.filter(k => k.length >= 2 && !STOP_WORDS.has(k));
     const activeVaultKws = vaultKeywords.length > 0 ? vaultKeywords : keywords;
@@ -2108,7 +2169,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
   }
 
   // Auto-Bridge matched Vaults -> original source chat IDs for screenshot/Vision OCR recall
-  if (!onlyQueriedRawFile && (isImgQuery || explicitUuid) && vaultsToSearch.length > 0 && spindle.chat?.getMessages) {
+  if (!onlyQueriedRawFile && (!matchedRawFile || explicitUuid) && (isImgQuery || explicitUuid) && vaultsToSearch.length > 0 && spindle.chat?.getMessages) {
    const candidateVaultIds = [];
    const addCand = (id) => {
     if (id && vaultMetaMap.has(id) && !candidateVaultIds.includes(id)) candidateVaultIds.push(id);
@@ -2132,7 +2193,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
    const imgKws = activeVaultKws.length > 0 ? activeVaultKws : keywords;
 
    for (const vId of candidateVaultIds) {
-    if (bridgedCount >= 4 || bridgeAttempts >= 6) break;
+    if (bridgedCount >= 3 || bridgeAttempts >= 6) break;
     const meta = vaultMetaMap.get(vId);
     if (!meta) continue;
 
@@ -2155,7 +2216,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
      continue;
     }
 
-    const topItems = collectMatchedChatMessages(chatMessages, query, imgKws, isImgQuery, explicitUuid, true);
+    const topItems = collectMatchedChatMessages(chatMessages, query, imgKws, isImgQuery, explicitUuid, true, meta.vaultNameMatched);
     if (topItems.length > 0) {
      bridgedCount++;
      const hasChunkHit = vaultCandidates.some(vc => vc.vaultId === vId);
