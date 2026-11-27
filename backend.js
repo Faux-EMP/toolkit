@@ -908,6 +908,186 @@ function getMsgTimestamp(m) {
   return m.created_at ?? m.timestamp ?? m.createdAt ?? m.send_date ?? m.sentAt ?? m.timeRange?.[0] ?? m.updated_at ?? m.updatedAt ?? null;
 }
 
+function getMsgTimestampMs(m) {
+ const raw = getMsgTimestamp(m);
+ if (!raw) return 0;
+ const num = Number(raw);
+ if (!isNaN(num) && num > 0) return num < 1e11 ? num * 1000 : num;
+ const parsed = Date.parse(String(raw));
+ return isNaN(parsed) ? 0 : parsed;
+}
+
+function normalizeBridgeTitle(str) {
+ return String(str || "")
+  .replace(/\s*[—–-]\s*[A-Z][a-z]{2,8}\s+\d{1,2},?\s+\d{4}\s*$/i, "")
+  .toLowerCase()
+  .replace(/\s+/g, " ")
+  .trim();
+}
+
+async function listUserChatsSafe(userId) {
+ if (!spindle.chats?.list) return [];
+ try {
+  let raw = null;
+  try {
+   raw = await spindle.chats.list({ limit: 200, userId }, userId);
+  } catch (_) {
+   raw = await spindle.chats.list(userId);
+  }
+  return Array.isArray(raw) ? raw : (raw?.chats || raw?.data || []);
+ } catch (err) {
+  console.warn("spindle.chats.list warning:", err.message);
+  return [];
+ }
+}
+
+function resolveVaultSourceChatId(vaultSummary, fullVault, allChats) {
+ const vId = vaultSummary?.id || fullVault?.id;
+ const directCandidates = [
+  fullVault?.source_chat_id,
+  fullVault?.sourceChatId,
+  fullVault?.chat_id,
+  fullVault?.chatId,
+  fullVault?.origin_chat_id,
+  fullVault?.originChatId,
+  fullVault?.metadata?.source_chat_id,
+  fullVault?.metadata?.sourceChatId,
+  fullVault?.metadata?.chat_id,
+  fullVault?.metadata?.chatId,
+  vaultSummary?.source_chat_id,
+  vaultSummary?.sourceChatId,
+  vaultSummary?.chat_id,
+  vaultSummary?.chatId
+ ];
+ for (const cand of directCandidates) {
+  if (typeof cand === "string" && cand.trim() && cand.trim() !== vId) {
+   return { chatId: cand.trim(), method: "metadata" };
+  }
+ }
+
+ const vaultTitleNorm = normalizeBridgeTitle(fullVault?.name || vaultSummary?.name || "");
+ if (!vaultTitleNorm || !Array.isArray(allChats) || allChats.length === 0) return null;
+
+ for (const ch of allChats) {
+  const cId = ch?.id || ch?.chat_id || ch?.chatId;
+  if (!cId) continue;
+  const cTitleNorm = normalizeBridgeTitle(ch?.title || ch?.name || "");
+  if (cTitleNorm && cTitleNorm === vaultTitleNorm) {
+   return { chatId: cId, method: "title-exact" };
+  }
+ }
+
+ let bestPartial = null;
+ let bestDiff = Infinity;
+ for (const ch of allChats) {
+  const cId = ch?.id || ch?.chat_id || ch?.chatId;
+  if (!cId) continue;
+  const cTitleNorm = normalizeBridgeTitle(ch?.title || ch?.name || "");
+  if (cTitleNorm.length < 5) continue;
+  if (vaultTitleNorm.includes(cTitleNorm) || cTitleNorm.includes(vaultTitleNorm)) {
+   const diff = Math.abs(vaultTitleNorm.length - cTitleNorm.length);
+   if (diff < bestDiff) {
+    bestDiff = diff;
+    bestPartial = { chatId: cId, method: "title-partial" };
+   }
+  }
+ }
+ return bestPartial;
+}
+
+function collectMatchedChatMessages(chatMessages, query, keywords, isImgQuery, explicitUuid, imagesOnly = false) {
+ if (!Array.isArray(chatMessages) || chatMessages.length === 0) return [];
+ const scoredMsgs = [];
+
+ const buildMsgEntry = (m, idx, scoreVal, isLatestTail = false) => {
+  const msgTime = formatTime(getMsgTimestamp(m)) || "";
+  const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
+  const attTag = formatAttachmentTags(m);
+  const hasAtt = Boolean(attTag);
+  const followUps = [];
+
+  if (hasAtt) {
+   for (let offset = 1; offset <= 3; offset++) {
+    const fMsg = chatMessages[idx + offset];
+    if (!fMsg) break;
+    const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
+    const fTime = formatTime(getMsgTimestamp(fMsg)) || "";
+    const fText = typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || "");
+    followUps.push({ msgIdx: idx + offset, role: fRole, time: fTime, text: fText });
+    if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
+   }
+  }
+
+  const role = m.role || m.name || (m.is_user ? "User" : "Assistant");
+  const latestPrefix = isLatestTail ? "LATEST | " : "";
+  let formatted = `[${latestPrefix}Message #${idx} | Time: ${msgTime} | ${role}]${attTag ? ` ${attTag}` : ""}\n${msgText}`;
+
+  for (const f of followUps) {
+   formatted += `\n ↳ [Paired #${f.msgIdx} | Time: ${f.time} | ${f.role}]\n${f.text}`;
+  }
+
+  return {
+   idx,
+   score: scoreVal,
+   timestampMs: getMsgTimestampMs(m),
+   formatted,
+   attIds: extractAttachmentIds(m),
+   rawText: msgText
+  };
+ };
+
+ chatMessages.forEach((m, idx) => {
+  const attTag = formatAttachmentTags(m);
+  const hasAtt = Boolean(attTag);
+  if (imagesOnly && !hasAtt) return;
+
+  const attIds = extractAttachmentIds(m);
+  const uuidHit = Boolean(explicitUuid && attIds.some(id => id.toLowerCase() === explicitUuid));
+  const msgTime = formatTime(getMsgTimestamp(m)) || "";
+  const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
+
+  let followUpTextCombined = "";
+  if (hasAtt) {
+   for (let offset = 1; offset <= 3; offset++) {
+    const fMsg = chatMessages[idx + offset];
+    if (!fMsg) break;
+    const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
+    followUpTextCombined += " " + (typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || ""));
+    if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
+   }
+  }
+
+  const combined = `${msgTime} ${attTag} ${msgText} ${followUpTextCombined}`;
+  let score = countKeywordMatches(combined, keywords);
+  if (uuidHit) score += 100;
+  else if (isImgQuery && hasAtt) score += keywords.length + 2;
+
+  const minRequired = (hasAtt || uuidHit) ? 1 : (keywords.length <= 4 ? Math.max(1, keywords.length - 1) : Math.max(2, keywords.length - 2));
+
+  if (score >= minRequired) {
+   scoredMsgs.push(buildMsgEntry(m, idx, score, false));
+  }
+ });
+
+ if (scoredMsgs.length === 0) return [];
+
+ // Highest score first; NEWEST message wins ties!
+ scoredMsgs.sort((a, b) => b.score - a.score || b.idx - a.idx);
+ const topItems = scoredMsgs.slice(0, imagesOnly ? 4 : 5);
+
+ if (!imagesOnly) {
+  const tailStart = Math.max(0, chatMessages.length - 2);
+  for (let tIdx = tailStart; tIdx < chatMessages.length; tIdx++) {
+   if (!topItems.some(item => item.idx === tIdx)) {
+    topItems.push(buildMsgEntry(chatMessages[tIdx], tIdx, 0, true));
+   }
+  }
+ }
+
+ topItems.sort((a, b) => a.idx - b.idx);
+ return topItems;
+}
+
 function getChunkStartIdx(c) {
   if (!c) return undefined;
   if (Array.isArray(c.messageRange) && c.messageRange.length > 0) return c.messageRange[0];
@@ -1616,9 +1796,13 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       }
     }
 
-    const vaultsToSearch = vaultMode === "all" ? (allVaults || []) : attachedVaults;
-    const vaultNames = vaultsToSearch.map(v => v.name).join(", ") || "None";
-    results.unshift(`[Vault Recall Mode: ${vaultMode.toUpperCase()} | Active Character: ${charInfo.name} | Accessible Archives: ${accessibleFolders.length} (+${rawFiles.length} Raw) | Searching Vaults (${vaultsToSearch.length}): ${vaultNames} | Active Interlinks: ${interlinkedChatIds.size}]`);
+  const vaultsToSearch = vaultMode === "all" ? (allVaults || []) : attachedVaults;
+  const vaultNames = vaultsToSearch.length === 0
+   ? "None"
+   : (vaultMode === "all" && vaultsToSearch.length > 6
+    ? `${vaultsToSearch.slice(0, 3).map(v => v.name).join(", ")} (+${vaultsToSearch.length - 3} more)`
+    : vaultsToSearch.map(v => v.name).join(", "));
+  results.unshift(`[Vault Recall Mode: ${vaultMode.toUpperCase()} | Active Character: ${charInfo.name} | Accessible Archives: ${accessibleFolders.length} (+${rawFiles.length} Raw) | Searching Vaults (${vaultsToSearch.length}): ${vaultNames} | Active Interlinks: ${interlinkedChatIds.size}]`);
 
     if (accessibleFolders.length > 0 && keywords.length > 0) {
       const matchedFolders = accessibleFolders.filter(f =>
@@ -1696,6 +1880,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     const MAX_TOTAL_VAULT_CHARS = 12000;
 
     const vaultCandidates = [];
+    const vaultMetaMap = new Map();
     let entitySectionsAdded = 0;
 
     if (!onlyQueriedRawFile && activeVaultKws.length > 0) {
@@ -1706,6 +1891,14 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
         const vaultLabel = vaultTime ? `${v.name} | Snapshot: ${vaultTime}` : v.name;
         const vaultNameMatched = matchesKeywords(v.name, activeVaultKws);
         const isExplicitlyAttached = attachedVaults.some(av => av.id === v.id);
+        vaultMetaMap.set(v.id, {
+        summary: v,
+        fullVault,
+        vaultLabel,
+        vaultOrder: vIdx,
+        vaultNameMatched,
+        isExplicitlyAttached
+        });
 
         if (entitySectionsAdded < 2) {
           const matchedEntities = (fullVault?.entities || [])
@@ -1838,171 +2031,220 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
       }
     }
 
-    for (const linkedChatId of interlinkedChatIds) {
-      if (keywords.length === 0) break;
-      if (spindle.memories?.entities?.list) {
-        const linkedEntities = await spindle.memories.entities.list(linkedChatId, {
-          activeOnly: false,
-          userId
-        });
-        const matchedEntities = (linkedEntities || [])
-          .filter(isUsefulEntity)
-          .filter(e => matchesKeywords(e.name, keywords) || matchesKeywords(JSON.stringify(e.facts || []), keywords) || matchesKeywords(e.description, keywords))
-          .map(cleanEntity);
+  const isImgQuery = /\b(screenshot|screenshots|image|images|pic|pics|picture|pictures|photo|attachment|attachments|shown|screen|hud)\b/i.test(query);
+  const uuidMatch = String(query || "").match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  const explicitUuid = uuidMatch ? uuidMatch[0].toLowerCase() : null;
+  const messageSectionsToRender = [];
 
-        if (matchedEntities.length > 0) {
-          results.push(`=== INTERLINKED CHAT ENTITIES (Chat: ${linkedChatId}) ===\n` + JSON.stringify(matchedEntities, null, 2));
-        }
-      }
+  for (const linkedChatId of interlinkedChatIds) {
+   if (keywords.length === 0) break;
+   if (spindle.memories?.entities?.list) {
+    const linkedEntities = await spindle.memories.entities.list(linkedChatId, {
+     activeOnly: false,
+     userId
+    });
+    const matchedEntities = (linkedEntities || [])
+     .filter(isUsefulEntity)
+     .filter(e => matchesKeywords(e.name, keywords) || matchesKeywords(JSON.stringify(e.facts || []), keywords) || matchesKeywords(e.description, keywords))
+     .map(cleanEntity);
 
-      let chatMessages = [];
-      if (spindle.chat?.getMessages) {
-        try {
-          const rawMsgs = await spindle.chat.getMessages(linkedChatId, userId);
-          chatMessages = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
-        } catch (err) {
-          console.warn("spindle.chat.getMessages failed:", err.message);
-        }
-      }
-
-      if (chatMessages.length > 0) {
-        const scoredMsgs = [];
-        const isImgQuery = /\b(screenshot|screenshots|image|images|pic|pics|picture|pictures|photo|attachment|attachments|shown|screen|hud)\b/i.test(query);
-
-        const buildMsgEntry = (m, idx, scoreVal, isLatestTail = false) => {
-          const msgTime = formatTime(getMsgTimestamp(m)) || "";
-          const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
-          const attTag = formatAttachmentTags(m);
-          const hasAtt = Boolean(attTag);
-          const followUps = [];
-
-          if (hasAtt) {
-            for (let offset = 1; offset <= 3; offset++) {
-              const fMsg = chatMessages[idx + offset];
-              if (!fMsg) break;
-              const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
-              const fTime = formatTime(getMsgTimestamp(fMsg)) || "";
-              const fText = typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || "");
-              followUps.push({ msgIdx: idx + offset, role: fRole, time: fTime, text: fText });
-              if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
-            }
-          }
-
-          const role = m.role || m.name || (m.is_user ? "User" : "Assistant");
-          const latestPrefix = isLatestTail ? "LATEST | " : "";
-          let formatted = `[${latestPrefix}Message #${idx} | Time: ${msgTime} | ${role}]${attTag ? ` ${attTag}` : ""}\n${msgText}`;
-
-          for (const f of followUps) {
-            formatted += `\n ↳ [Paired #${f.msgIdx} | Time: ${f.time} | ${f.role}]\n${f.text}`;
-          }
-
-          return {
-            idx,
-            score: scoreVal,
-            formatted,
-            attIds: extractAttachmentIds(m),
-            rawText: msgText
-          };
-        };
-
-        chatMessages.forEach((m, idx) => {
-          const msgTime = formatTime(getMsgTimestamp(m)) || "";
-          const msgText = typeof m.content === "string" ? m.content : (m.mes || m.text || JSON.stringify(m.content || ""));
-          const attTag = formatAttachmentTags(m);
-          const hasAtt = Boolean(attTag);
-
-          let followUpTextCombined = "";
-          if (hasAtt) {
-            for (let offset = 1; offset <= 3; offset++) {
-              const fMsg = chatMessages[idx + offset];
-              if (!fMsg) break;
-              const fRole = fMsg.role || fMsg.name || (fMsg.is_user ? "User" : "Assistant");
-              followUpTextCombined += " " + (typeof fMsg.content === "string" ? fMsg.content : (fMsg.mes || fMsg.text || ""));
-              if (fRole.toLowerCase().includes("assistant") || fMsg.is_user === false) break;
-            }
-          }
-
-          const combined = `${msgTime} ${attTag} ${msgText} ${followUpTextCombined}`;
-          let score = countKeywordMatches(combined, keywords);
-          if (isImgQuery && hasAtt) score += keywords.length + 2;
-
-          const minRequired = hasAtt ? 1 : (keywords.length <= 4 ? Math.max(1, keywords.length - 1) : Math.max(2, keywords.length - 2));
-
-          if (score >= minRequired) {
-            scoredMsgs.push(buildMsgEntry(m, idx, score, false));
-          }
-        });
-
-        // ONLY include results (and the last 2 messages) if this Interlinked chat actually matched the search!
-        if (scoredMsgs.length > 0) {
-          scoredMsgs.sort((a, b) => b.score - a.score || a.idx - b.idx);
-          const topItems = scoredMsgs.slice(0, 5);
-
-          const tailStart = Math.max(0, chatMessages.length - 2);
-          for (let tIdx = tailStart; tIdx < chatMessages.length; tIdx++) {
-            if (!topItems.some(item => item.idx === tIdx)) {
-              topItems.push(buildMsgEntry(chatMessages[tIdx], tIdx, 0, true));
-            }
-          }
-          topItems.sort((a, b) => a.idx - b.idx);
-
-          const visionCache = await getVisionCacheMap(userId);
-          let liveScansUsed = 0;
-          const topMsgs = [];
-
-          for (const item of topItems) {
-            let block = item.formatted;
-            for (const imgId of (item.attIds || [])) {
-              if (visionCache[imgId]) {
-                block += `\n [Cached Vision OCR (${imgId})]:\n${visionCache[imgId]}`;
-              } else if (liveScansUsed < 1 && (isImgQuery || query.toLowerCase().includes(imgId.toLowerCase()))) {
-                liveScansUsed++;
-                const liveDesc = await analyzeImageById(imgId, userId, item.rawText, query);
-                if (liveDesc) {
-                  block += `\n [Live Vision OCR (${imgId})]:\n${liveDesc}`;
-                }
-              }
-            }
-            topMsgs.push(block);
-          }
-
-          results.push(`=== INTERLINKED MESSAGES (Chat: ${linkedChatId} | Total: ${chatMessages.length}) ===\n` + topMsgs.join("\n---\n"));
-        }
-      }
-
-      if (spindle.memories?.chatMemory?.listChunks) {
-        const rawChunks = await spindle.memories.chatMemory.listChunks(linkedChatId, userId);
-        const chatChunks = (Array.isArray(rawChunks) ? rawChunks : (rawChunks?.chunks || [])).map((c, idx) => ({ ...c, _arrIdx: idx }));
-        const enrichedChunks = chatChunks.map(c => {
-          const startIdx = getChunkStartIdx(c) ?? c.start_index ?? c.start_message_index;
-          const realMsg = (startIdx !== undefined && chatMessages[startIdx]) ? chatMessages[startIdx] : null;
-          const realTime = getMsgTimestamp(realMsg);
-          return realTime ? { ...c, timestamp: realTime } : c;
-        });
-
-        const matchedChunks = enrichedChunks
-          .map(c => {
-            const timeStr = formatTime(c.timestamp || c.timeRange || c.created_at || c.createdAt || c.updatedAt) || "";
-            const score = countKeywordMatches(`${timeStr} ${c.content || c.text || ""}`, keywords);
-            return { c, score };
-          })
-          .filter(item => item.score > 0)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 5)
-          .map(item => item.c);
-
-        // ONLY append the final 1 chunk if this Interlinked chat already had matching chunks!
-        if (matchedChunks.length > 0 && enrichedChunks.length > 0) {
-          const chronological = [...enrichedChunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
-          const tailChunk = chronological[chronological.length - 1];
-          if (tailChunk && !matchedChunks.some(mc => (mc.id || mc._arrIdx) === (tailChunk.id || tailChunk._arrIdx))) {
-            matchedChunks.push({ ...tailChunk, _latestTag: "LATEST CHUNK" });
-          }
-          const formattedChunks = formatAndSortChunks(matchedChunks);
-          results.push(`=== INTERLINKED CHAT CHUNKS (Chat: ${linkedChatId}) ===\n` + formattedChunks.join("\n---\n"));
-        }
-      }
+    if (matchedEntities.length > 0) {
+     results.push(`=== INTERLINKED CHAT ENTITIES (Chat: ${linkedChatId}) ===\n` + JSON.stringify(matchedEntities, null, 2));
     }
+   }
+
+   let chatMessages = [];
+   if (spindle.chat?.getMessages) {
+    try {
+     const rawMsgs = await spindle.chat.getMessages(linkedChatId, userId);
+     chatMessages = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
+    } catch (err) {
+     console.warn("spindle.chat.getMessages failed:", err.message);
+    }
+   }
+
+   if (chatMessages.length > 0) {
+    const topItems = collectMatchedChatMessages(chatMessages, query, keywords, isImgQuery, explicitUuid, false);
+    if (topItems.length > 0) {
+     messageSectionsToRender.push({
+      header: `=== INTERLINKED MESSAGES (Chat: ${linkedChatId} | Total: ${chatMessages.length}) ===`,
+      items: topItems,
+      priorityBonus: 2
+     });
+    }
+   }
+
+   if (spindle.memories?.chatMemory?.listChunks) {
+    const rawChunks = await spindle.memories.chatMemory.listChunks(linkedChatId, userId);
+    const chatChunks = (Array.isArray(rawChunks) ? rawChunks : (rawChunks?.chunks || [])).map((c, idx) => ({ ...c, _arrIdx: idx }));
+    const enrichedChunks = chatChunks.map(c => {
+     const startIdx = getChunkStartIdx(c) ?? c.start_index ?? c.start_message_index;
+     const realMsg = (startIdx !== undefined && chatMessages[startIdx]) ? chatMessages[startIdx] : null;
+     const realTime = getMsgTimestamp(realMsg);
+     return realTime ? { ...c, timestamp: realTime } : c;
+    });
+
+    const matchedChunks = enrichedChunks
+     .map(c => {
+      const timeStr = formatTime(c.timestamp || c.timeRange || c.created_at || c.createdAt || c.updatedAt) || "";
+      const score = countKeywordMatches(`${timeStr} ${c.content || c.text || ""}`, keywords);
+      return { c, score };
+     })
+     .filter(item => item.score > 0)
+     .sort((a, b) => b.score - a.score)
+     .slice(0, 5)
+     .map(item => item.c);
+
+    if (matchedChunks.length > 0 && enrichedChunks.length > 0) {
+     const chronological = [...enrichedChunks].sort((a, b) => getChunkOrder(a) - getChunkOrder(b));
+     const tailChunk = chronological[chronological.length - 1];
+     if (tailChunk && !matchedChunks.some(mc => (mc.id || mc._arrIdx) === (tailChunk.id || tailChunk._arrIdx))) {
+      matchedChunks.push({ ...tailChunk, _latestTag: "LATEST CHUNK" });
+     }
+     const formattedChunks = formatAndSortChunks(matchedChunks);
+     results.push(`=== INTERLINKED CHAT CHUNKS (Chat: ${linkedChatId}) ===\n` + formattedChunks.join("\n---\n"));
+    }
+   }
+  }
+
+  // Auto-Bridge matched Vaults -> original source chat IDs for screenshot/Vision OCR recall
+  if (!onlyQueriedRawFile && (isImgQuery || explicitUuid) && vaultsToSearch.length > 0 && spindle.chat?.getMessages) {
+   const candidateVaultIds = [];
+   const addCand = (id) => {
+    if (id && vaultMetaMap.has(id) && !candidateVaultIds.includes(id)) candidateVaultIds.push(id);
+   };
+
+   for (const vc of vaultCandidates.slice(0, MAX_GLOBAL_VAULT_CHUNKS)) addCand(vc.vaultId);
+   for (const [id, meta] of vaultMetaMap.entries()) {
+    if (meta.vaultNameMatched) addCand(id);
+   }
+   for (const [id, meta] of vaultMetaMap.entries()) {
+    if (meta.isExplicitlyAttached) addCand(id);
+   }
+   if (candidateVaultIds.length === 0) {
+    for (const v of vaultsToSearch.slice(0, 3)) addCand(v.id);
+   }
+
+   const bridgedChatIds = new Set();
+   let cachedChatsList = null;
+   let bridgedCount = 0;
+   let bridgeAttempts = 0;
+   const imgKws = activeVaultKws.length > 0 ? activeVaultKws : keywords;
+
+   for (const vId of candidateVaultIds) {
+    if (bridgedCount >= 4 || bridgeAttempts >= 6) break;
+    const meta = vaultMetaMap.get(vId);
+    if (!meta) continue;
+
+    let bridge = resolveVaultSourceChatId(meta.summary, meta.fullVault, []);
+    if (!bridge) {
+     if (cachedChatsList === null) cachedChatsList = await listUserChatsSafe(userId);
+     bridge = resolveVaultSourceChatId(meta.summary, meta.fullVault, cachedChatsList);
+    }
+    if (!bridge?.chatId || bridge.chatId === chatId || interlinkedChatIds.has(bridge.chatId) || bridgedChatIds.has(bridge.chatId)) continue;
+
+    bridgedChatIds.add(bridge.chatId);
+    bridgeAttempts++;
+
+    let chatMessages = [];
+    try {
+     const rawMsgs = await spindle.chat.getMessages(bridge.chatId, userId);
+     chatMessages = Array.isArray(rawMsgs) ? rawMsgs : (rawMsgs?.messages || rawMsgs?.data || []);
+    } catch (err) {
+     console.warn("Vault-bridge getMessages failed:", err.message);
+     continue;
+    }
+
+    const topItems = collectMatchedChatMessages(chatMessages, query, imgKws, isImgQuery, explicitUuid, true);
+    if (topItems.length > 0) {
+     bridgedCount++;
+     const hasChunkHit = vaultCandidates.some(vc => vc.vaultId === vId);
+     messageSectionsToRender.push({
+      header: `=== VAULT-BRIDGED IMAGES (${meta.vaultLabel} -> Chat: ${bridge.chatId} via ${bridge.method}) ===`,
+      items: topItems,
+      priorityBonus: (meta.vaultNameMatched ? 2 : 0) + (hasChunkHit ? 2 : 0)
+     });
+    }
+   }
+  }
+
+  // Global Vision OCR prioritization: at most 1 live scan per turn (UUID > Score > Newest)
+  if (messageSectionsToRender.length > 0 || explicitUuid) {
+   const visionCache = await getVisionCacheMap(userId);
+   let bestLiveTarget = null;
+
+   for (const sec of messageSectionsToRender) {
+    for (const item of sec.items) {
+     for (const imgId of (item.attIds || [])) {
+      if (visionCache[imgId]) continue;
+      const isExactUuid = Boolean(explicitUuid && imgId.toLowerCase() === explicitUuid);
+      if (!isImgQuery && !isExactUuid) continue;
+
+      const cand = {
+       imgId,
+       rawText: item.rawText,
+       isExactUuid,
+       score: item.score + (sec.priorityBonus || 0),
+       timestampMs: item.timestampMs || 0,
+       idx: item.idx
+      };
+
+      if (
+       !bestLiveTarget ||
+       (cand.isExactUuid && !bestLiveTarget.isExactUuid) ||
+       (cand.isExactUuid === bestLiveTarget.isExactUuid && (
+        cand.score > bestLiveTarget.score ||
+        (cand.score === bestLiveTarget.score && (
+         cand.timestampMs > bestLiveTarget.timestampMs ||
+         (cand.timestampMs === bestLiveTarget.timestampMs && cand.idx > bestLiveTarget.idx)
+        ))
+       ))
+      ) {
+       bestLiveTarget = cand;
+      }
+     }
+    }
+   }
+
+   let liveOcrResult = null;
+   if (bestLiveTarget) {
+    liveOcrResult = await analyzeImageById(bestLiveTarget.imgId, userId, bestLiveTarget.rawText, query);
+   }
+
+   for (const sec of messageSectionsToRender) {
+    const renderedMsgs = [];
+    for (const item of sec.items) {
+     let block = item.formatted;
+     for (const imgId of (item.attIds || [])) {
+      if (visionCache[imgId]) {
+       block += `\n [Cached Vision OCR (${imgId})]:\n${visionCache[imgId]}`;
+      } else if (bestLiveTarget && bestLiveTarget.imgId === imgId && liveOcrResult) {
+       block += `\n [Live Vision OCR (${imgId})]:\n${liveOcrResult}`;
+      }
+     }
+     renderedMsgs.push(block);
+    }
+    results.push(`${sec.header}\n` + renderedMsgs.join("\n---\n"));
+   }
+
+   // Direct UUID fallback in case the image belongs to an unmatched/deleted chat
+   if (explicitUuid) {
+    const alreadyShown = messageSectionsToRender.some(sec =>
+     sec.items.some(item => (item.attIds || []).some(id => id.toLowerCase() === explicitUuid))
+    );
+    if (!alreadyShown) {
+     const cachedKey = Object.keys(visionCache).find(k => k.toLowerCase() === explicitUuid);
+     if (cachedKey) {
+      results.push(`=== DIRECT CACHED VISION OCR (${cachedKey}) ===\n${visionCache[cachedKey]}`);
+     } else if (!bestLiveTarget) {
+      const directDesc = await analyzeImageById(explicitUuid, userId, "", query);
+      if (directDesc) {
+       results.push(`=== DIRECT VISION OCR (${explicitUuid}) ===\n${directDesc}`);
+      }
+     }
+    }
+   }
+  }
 
     globalThis._lastRecallDoneAt = Date.now();
     const rpmFooter = "\n\n[TOOLKIT RPM GUARD: 1 tool call used this turn (5 RPM limit). Do NOT chain another tool call in this turn—respond to User now.]";
