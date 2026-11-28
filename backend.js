@@ -903,6 +903,19 @@ function formatTime(val) {
   });
 }
 
+function getCurrentTimeReadout() {
+  return new Date().toLocaleString("en-US", {
+    timeZone: "Asia/Jakarta",
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true
+  }) + " (UTC+7)";
+}
+
 function getMsgTimestamp(m) {
   if (!m) return null;
   return m.created_at ?? m.timestamp ?? m.createdAt ?? m.send_date ?? m.sentAt ?? m.timeRange?.[0] ?? m.updated_at ?? m.updatedAt ?? null;
@@ -1743,6 +1756,11 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
     return "=== SPINDLE API INSPECTION ===\n" + await inspectSpindle(chatId, userId, payload);
   }
 
+  if (query === "__time__") {
+  globalThis._lastRecallDoneAt = Date.now();
+  return `[Current Time: ${getCurrentTimeReadout()}]`;
+}
+
   const charInfo = await getActiveCharacterInfo(chatId, userId, payload);
   const results = [];
 
@@ -1804,8 +1822,9 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
   const rawFiles = await getRawDatabankFiles(userId, charInfo.name);
 
   if (query === "__list_folders__") {
-    if (accessibleFolders.length === 0 && rawFiles.length === 0) return "No Archive folders have been created yet.";
-    return "=== ACCESSIBLE ARCHIVE FOLDERS ===\n" + JSON.stringify({
+    const nowHeader = `[Current Time: ${getCurrentTimeReadout()}]`;
+    if (accessibleFolders.length === 0 && rawFiles.length === 0) return `${nowHeader}\nNo Archive folders have been created yet.`;
+    return `${nowHeader}\n=== ACCESSIBLE ARCHIVE FOLDERS ===\n` + JSON.stringify({
       compiledDossiers: accessibleFolders.map(f => ({
         name: f.name,
         type: f.type,
@@ -1859,7 +1878,7 @@ spindle.on("TOOL_INVOCATION", async (payload, eventUserId) => {
    : (vaultMode === "all" && vaultsToSearch.length > 6
     ? `${vaultsToSearch.slice(0, 3).map(v => v.name).join(", ")} (+${vaultsToSearch.length - 3} more)`
     : vaultsToSearch.map(v => v.name).join(", "));
-  results.unshift(`[Vault Recall Mode: ${vaultMode.toUpperCase()} | Active Character: ${charInfo.name} | Accessible Archives: ${accessibleFolders.length} (+${rawFiles.length} Raw) | Searching Vaults (${vaultsToSearch.length}): ${vaultNames} | Active Interlinks: ${interlinkedChatIds.size}]`);
+  results.unshift(`[Current Time: ${getCurrentTimeReadout()} | Vault Recall Mode: ${vaultMode.toUpperCase()} | Active Character: ${charInfo.name} | Accessible Archives: ${accessibleFolders.length} (+${rawFiles.length} Raw) | Searching Vaults (${vaultsToSearch.length}): ${vaultNames} | Active Interlinks: ${interlinkedChatIds.size}]`);
 
     if (accessibleFolders.length > 0 && keywords.length > 0) {
       const matchedFolders = accessibleFolders.filter(f =>
